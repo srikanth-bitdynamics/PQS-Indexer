@@ -16,6 +16,7 @@ private[ledgerapi] sealed trait DataAdapter[T]:
   def offset: Long
   def commandId: String
   def workflowId: String
+  def synchronizerId: String
   def effectiveAt: Timestamp
   def externalTransactionHash: Option[Array[Byte]]
   def paidTrafficCost: Option[Long]
@@ -36,6 +37,7 @@ private[ledgerapi] object DataAdapter:
     override def offset: Long                                 = tx.offset
     override def commandId: String                            = tx.commandId
     override def workflowId: String                           = tx.workflowId
+    override def synchronizerId: String                       = tx.synchronizerId
     override def effectiveAt: Timestamp                       = tx.getEffectiveAt
     override def externalTransactionHash: Option[Array[Byte]] = extractors.externalTransactionHash(tx)
     override def paidTrafficCost: Option[Long]                = tx.paidTrafficCost

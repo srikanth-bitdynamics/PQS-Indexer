@@ -3,10 +3,10 @@
 
 package com.digitalasset.pqs.backend
 
-import com.digitalasset.canonical.ReassignmentEvent
+import com.digitalasset.canonical.{ReassignmentEvent, UserRight}
 import com.digitalasset.canonical.specific.{Event, Offset, Transaction, TreeEvent}
 import com.digitalasset.pqs.backend.Datastore.ProcessingSink
-import zio.Task
+import zio.{Task, ZIO}
 import zio.stream.ZSink
 
 /** Defines common interface for pluggable data stores. The bridge will ask for the last known position of the data
@@ -44,10 +44,37 @@ trait Datastore:
   /** Process the remaining transactions */
   def processTransactions
       : ProcessingSink[(Transaction[Event | TreeEvent | ReassignmentEvent], Datastore.TransactionIndex)]
+
+  /** Capabilities this datastore opts into. The defaults describe the document backend. */
+  def capabilities: Datastore.Capabilities = Datastore.Capabilities()
+
+  /** Record the ingestion coverage the pipeline resolved for this run. Datastores that do not track coverage ignore it.
+    */
+  def recordCoverage(record: Datastore.CoverageRecord): Task[Unit] = ZIO.unit
 end Datastore
 
 object Datastore:
   type TransactionIndex  = Long
   type Checkpoint        = (Offset, TransactionIndex)
   type ProcessingSink[A] = ZSink[Any, Throwable, A, Nothing, Unit]
+
+  final case class Capabilities(reassignments: Boolean = false, coverage: Boolean = false)
+
+  enum Datasource:
+    case TransactionStream, TransactionTreeStream
+
+  /** Ingestion scope the pipeline resolved for a run, from which a datastore derives its coverage metadata. */
+  final case class CoverageRecord(
+      requestedStart: String,
+      normalizedStart: Offset,
+      actualStart: Offset,
+      ledgerStart: Offset,
+      ledgerEnd: Offset,
+      dbEnd: Offset,
+      acsSeedOffset: Option[Offset],
+      datasource: Datasource,
+      rights: UserRight,
+      contractFilter: String,
+      metadataFilter: String
+  )
 end Datastore
