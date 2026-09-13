@@ -4,7 +4,7 @@
 package com.digitalasset.pqs
 
 import com.digitalasset.pqs.app.*
-import com.digitalasset.pqs.postgres.document
+import com.digitalasset.pqs.postgres.{document, relational}
 
 object Main extends ComposableApp:
   private val Pqs                             = "pqs"
@@ -18,7 +18,7 @@ object Main extends ComposableApp:
   private object Datastore extends ComposableApp:
     def app =
       "datastore" @@ Command("Perform operations supporting a certified data store")
-        - document.Main.app /* | relational.Main.app */
+        - (document.Main.app | relational.Main.app)
   end Datastore
 
 end Main

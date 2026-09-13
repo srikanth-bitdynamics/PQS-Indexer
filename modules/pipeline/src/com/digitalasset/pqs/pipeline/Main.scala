@@ -14,6 +14,7 @@ import com.digitalasset.pqs.logging.ConsoleLogging
 import com.digitalasset.pqs.pipeline.pipeline.Pipeline
 import com.digitalasset.pqs.postgres.backend
 import com.digitalasset.pqs.postgres.document.{DocumentPostgres, SqlSchema}
+import com.digitalasset.pqs.postgres.relational.{RelSqlSchema, RelationalPostgres}
 import com.digitalasset.pqs.{app, configuration, pipeline}
 import com.digitalasset.transcode.codec.json.JsonCodec
 import com.digitalasset.transcode.schema.Dictionary
@@ -38,11 +39,31 @@ object Main extends ComposableApp:
   private def source = "ledger" @@ Variant("Daml ledger")
 
   private def destination =
-    destinationPostgresDocument @@ Variant("Postgres database (w/ document payload representation)")
+    destinationPostgresDocument @@ Variant("Postgres database (w/ document payload representation)") |
+      destinationPostgresRelational @@ Variant("Postgres database (w/ relational payload representation)")
 
   private def destinationPostgresRelational =
     "postgres-relational" `as`
-      ZLayer.fail(Exception("Unimplemented"))
+      (
+        ZLayer.service[ConfigPipeline].project(_.target.postgres)
+          >+> ZLayer.service[ConfigPipeline].project(_.pipeline.filter.contracts)
+          >+> DamlSchema.produce(RelSqlSchema)
+          >+> ZLayer
+            .service[ConfigPipeline]
+            .flatMap { confEnv =>
+              val conf = confEnv.get
+              DamlSchema.produce(
+                JsonCodec(
+                  encodeNumericAsString = conf.target.encoding.numericAsString,
+                  encodeInt64AsString = conf.target.encoding.int64AsString,
+                  removeTrailingNonesInRecords = conf.target.encoding.excludeNulls
+                )
+              )
+            }
+            .update(_.matchByPackageId)
+      )
+      >+> ZLayer.service[ConfigPipeline].project(_.target.schema)
+      >+> RelationalPostgres.live
 
   private def destinationPostgresDocument =
     "postgres-document" `as`

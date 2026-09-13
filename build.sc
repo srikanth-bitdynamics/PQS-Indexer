@@ -317,7 +317,8 @@ object `package` extends RootModule { root =>
       `app-blocks`.diagnostics,
       `app-blocks`.o11y,
       backend,
-      postgres.document
+      postgres.document,
+      postgres.relational
     )
 
     override def ivyDeps = Agg(
@@ -395,16 +396,27 @@ object `package` extends RootModule { root =>
 
     object relational extends PqsModule {
       override def ivyDeps = Agg(
+        L.commons.text,
         L.flyway.core,
         L.flyway.driverPostgres,
-        L.classgraph
+        L.jackson.core,
+        L.jackson.databind,
+        L.classgraph,
+        L.transcode.json
       )
 
       override val moduleDeps = Seq(
+        `app-blocks`.`app-version`,
+        `app-blocks`.`bootstrap-cli`,
         `app-blocks`.`composable-app`,
+        `app-blocks`.config,
         `app-blocks`.o11y,
-        postgres.backend
+        auth,
+        postgres.backend,
+        `zio-daml`
       )
+
+      object test extends PqsTests
     }
   }
 
