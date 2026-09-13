@@ -87,7 +87,8 @@ object specific:
     final case class Archived(
         eventId: EventId,
         templateId: schema.Identifier,
-        contractId: ContractId
+        contractId: ContractId,
+        witnesses: Chunk[Party]
     ) extends TransactionEvent
 
     final case class Exercised(

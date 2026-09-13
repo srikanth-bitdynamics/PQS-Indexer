@@ -28,6 +28,38 @@ object Pipeline:
   val streamUpGauge = Metric.gauge("stream_up", "Pipeline stream is up")
   val layer         = ZLayer.fromFunction(Impl.apply).as[Pipeline]
 
+  private[pipeline] def coverageRecord(
+      requestedStart: String,
+      datasource: Config.TransactionApi,
+      contractFilter: String,
+      metadataFilter: String,
+      rights: UserRight,
+      normalizedStart: Offset,
+      actualStart: Offset,
+      ledgerStart: Offset,
+      ledgerEnd: Offset,
+      dbEnd: Offset
+  ): Datastore.CoverageRecord =
+    val acsSeedOffset = (dbEnd, actualStart) match
+      case (Offset.Genesis, seed: Offset.Absolute) => Some(seed)
+      case _                                       => None
+    val mappedDatasource = datasource match
+      case Config.TransactionApi.TransactionStream     => Datastore.Datasource.TransactionStream
+      case Config.TransactionApi.TransactionTreeStream => Datastore.Datasource.TransactionTreeStream
+    Datastore.CoverageRecord(
+      requestedStart = requestedStart,
+      normalizedStart = normalizedStart,
+      actualStart = actualStart,
+      ledgerStart = ledgerStart,
+      ledgerEnd = ledgerEnd,
+      dbEnd = dbEnd,
+      acsSeedOffset = acsSeedOffset,
+      datasource = mappedDatasource,
+      rights = rights,
+      contractFilter = contractFilter,
+      metadataFilter = metadataFilter
+    )
+
 private case class Impl(
     config: Config,
     ledger: Ledger,
@@ -99,6 +131,20 @@ private case class Impl(
           )
           _ <- logInfo(
             s"Continuing from offset '$continueFromOffset' and index '$continueFromIx' until offset '$actualEnd'"
+          )
+          _ <- datastore.recordCoverage(
+            Pipeline.coverageRecord(
+              requestedStart = config.ledger.start.toString,
+              datasource = config.datasource,
+              contractFilter = config.filter.contracts.toString,
+              metadataFilter = config.filter.metadata.toString,
+              rights = rights,
+              normalizedStart = normalizedStart,
+              actualStart = continueFromOffset,
+              ledgerStart = ledgerStart,
+              ledgerEnd = ledgerEnd,
+              dbEnd = dbEnd
+            )
           )
         yield (rights, offsetAndIx, actualEnd)
       }

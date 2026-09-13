@@ -10,7 +10,7 @@ import com.daml.ledger.api.v2.update_service.GetUpdatesResponse
 import com.daml.ledger.api.v2.update_service.ZioUpdateService.UpdateServiceClient
 import com.digitalasset.canonical.UserRight.AsAnyParty
 import com.digitalasset.canonical.specific.Offset
-import com.digitalasset.canonical.{ContractFilter, MetadataFilter}
+import com.digitalasset.canonical.{ContractFilter, DomainId, MetadataFilter}
 import com.digitalasset.transcode.schema.*
 import com.digitalasset.zio.daml.{DamlSchema, ProtobufCodecs}
 import com.digitalasset.zio.daml.ledgerapi.UpdateServiceClientMock.GetUpdates
@@ -259,5 +259,20 @@ object UpdateServiceSpec extends ZIOSpecDefault:
             result.head.effectiveAt.contains(TimestampConverters.asJavaInstant(effectiveAt))
           )
         )
+      ,
+      test("getTransactions - populates domainId from the synchronizer id"):
+        val withSync = GetUpdatesResponse.defaultInstance.withTransaction(
+          Transaction.defaultInstance.withOffset(first).withSynchronizerId("sync-1")
+        )
+        val expectations = GetUpdates(anything, value(ZStream.succeed(withSync)))
+        (for
+          service <- ZIO.service[UpdateService]
+          result <- service
+            .getTransactions(dummyRight, offset(first), offset(first))
+            .map(_.domainId)
+            .runCollect
+        yield assertTrue(
+          result == Chunk(Some(DomainId("sync-1")))
+        )).provideLayer(serviceLayer(expectations.toLayer))
     )
   )

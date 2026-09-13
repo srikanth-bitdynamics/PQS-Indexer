@@ -114,7 +114,8 @@ object specific:
     yield Event.Archived(
       eventId = EventId(evt.offset, evt.nodeId),
       templateId = templateId,
-      contractId = ContractId(evt.contractId)
+      contractId = ContractId(evt.contractId),
+      witnesses = evt.witnessParties.to(Chunk).map(Party)
     )
 
   private def convertUnassignedEvent(

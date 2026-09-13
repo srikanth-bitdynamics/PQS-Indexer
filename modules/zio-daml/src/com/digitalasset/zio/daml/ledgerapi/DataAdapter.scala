@@ -18,6 +18,7 @@ private[ledgerapi] sealed trait DataAdapter[T]:
   def offset: Long
   def commandId: String
   def workflowId: String
+  def synchronizerId: String
   def effectiveAt: Option[Instant]
   def externalTransactionHash: Option[Array[Byte]]
   def paidTrafficCost: Option[Long]
@@ -38,6 +39,7 @@ private[ledgerapi] object DataAdapter:
     override def offset: Long                 = tx.offset
     override def commandId: String            = tx.commandId
     override def workflowId: String           = tx.workflowId
+    override def synchronizerId: String = tx.synchronizerId
     override def effectiveAt: Option[Instant] = Some(TimestampConverters.asJavaInstant(tx.getEffectiveAt))
     override def externalTransactionHash: Option[Array[Byte]] = extractors.externalTransactionHash(tx)
     override def paidTrafficCost: Option[Long]                = tx.paidTrafficCost
@@ -51,6 +53,7 @@ private[ledgerapi] object DataAdapter:
     override def offset: Long          = reassignment.offset
     override def commandId: String     = reassignment.commandId
     override def workflowId: String    = reassignment.workflowId
+    override def synchronizerId: String = reassignment.synchronizerId
     // A Reassignment carries no ledger effective time: no Daml code is interpreted, so there is
     // nothing for one to be the answer to. `record_time` is a different quantity, set by the
     // synchronizer rather than the submitting participant, and is deliberately not substituted here

@@ -376,7 +376,7 @@ final case class DocumentPostgres(
         )
         contracts :+ evt
 
-      case canonical.specific.Event.Archived(eid, tid, cid) =>
+      case canonical.specific.Event.Archived(eid, tid, cid, _) =>
         val evt = model.Event(
           Event(
             pk = pk,

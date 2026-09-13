@@ -86,10 +86,10 @@ object ReassignmentSpec extends FuncTest[Service[Ledger] & Postgres & DeployedDa
           .returns(
             table {
               // submitAndWait guarantees the causal order of these multi-sync transactions
-              createdAtOffset.capture    | null | false
-              unassignedAtOffset.capture | null | true
-              assignedAtOffset.capture   | null | true
-              archivedAtOffset.capture   | null | false
+              createdAtOffset.capture    | sync1.id | false
+              unassignedAtOffset.capture | sync1.id | true
+              assignedAtOffset.capture   | sync2.id | true
+              archivedAtOffset.capture   | sync2.id | false
             }
           )
 
@@ -192,10 +192,10 @@ object ReassignmentSpec extends FuncTest[Service[Ledger] & Postgres & DeployedDa
           .query(sql"""select "offset", domain_id from __transactions order by "offset"""")
           .returns(
             table {
-              assignedAtOffset.offset   | null
-              archivedAtOffset.offset   | null
-              createdAtOffset.offset    | null
-              unassignedAtOffset.offset | null
+              assignedAtOffset.offset   | sync2.id
+              archivedAtOffset.offset   | sync2.id
+              createdAtOffset.offset    | sync1.id
+              unassignedAtOffset.offset | sync1.id
             }
           )
 
