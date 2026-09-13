@@ -1,6 +1,3 @@
--- Copyright (c) 2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
--- SPDX-License-Identifier: Apache-2.0
-
 create type rel_event_kind as enum ('create', 'exercise', 'archive');
 create type rel_source_kind as enum ('stream', 'acs_seed', 'ledger_replay', 'document_backfill');
 create type rel_archive_source as enum ('native', 'consuming_exercise');

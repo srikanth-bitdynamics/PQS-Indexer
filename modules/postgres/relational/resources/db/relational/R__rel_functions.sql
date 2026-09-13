@@ -1,6 +1,3 @@
--- Copyright (c) 2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
--- SPDX-License-Identifier: Apache-2.0
-
 create or replace function __rel_make_aliases(package_name text, module_name text, entity_name text) returns text[] as
 $$
 declare
