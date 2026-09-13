@@ -7,6 +7,7 @@ import com.digitalasset.canonical.*
 import com.digitalasset.canonical.specific.Offset
 import com.digitalasset.pqs.o11y.traces
 import com.digitalasset.pqs.o11y.traces.{DetachedSpan, given}
+import com.digitalasset.pqs.postgres.backend.IdPlaceholder
 import com.digitalasset.pqs.postgres.document.specific
 import com.digitalasset.pqs.postgres.document.specific.ValueConverter
 import io.opentelemetry.api.trace.SpanContext
