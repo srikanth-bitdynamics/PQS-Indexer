@@ -366,6 +366,8 @@ object `package` extends RootModule { root =>
         `app-blocks`.o11y,
         root.backend
       )
+
+      object test extends PqsTests
     }
 
     object document extends PqsModule {

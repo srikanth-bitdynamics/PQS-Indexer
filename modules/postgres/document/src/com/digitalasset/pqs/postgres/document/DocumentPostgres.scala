@@ -294,7 +294,7 @@ final case class DocumentPostgres(
         tx.offset,
         Some(tx.transactionId),
         Some(tx.effectiveAt),
-        tx.domainId,
+        None, // synchronizer id is not persisted by the document backend
         Some(tx.workflowId),
         tx.remoteSpan,
         tx.externalTransactionHash,
@@ -376,7 +376,7 @@ final case class DocumentPostgres(
         )
         contracts :+ evt
 
-      case canonical.specific.Event.Archived(eid, tid, cid) =>
+      case canonical.specific.Event.Archived(eid, tid, cid, _) =>
         val evt = model.Event(
           Event(
             pk = pk,
