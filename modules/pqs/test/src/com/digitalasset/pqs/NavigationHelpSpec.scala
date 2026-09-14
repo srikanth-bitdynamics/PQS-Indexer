@@ -32,7 +32,8 @@ Run 'pqs COMMAND --help[-verbose]' for more information on a command.
 Perform operations supporting a certified data store
 
 Commands:
-  postgres-document    Perform operations supporting Postgres database (w/ document payload representation)
+  postgres-document      Perform operations supporting Postgres database (w/ document payload representation)
+  postgres-relational    Perform operations supporting Postgres database (w/ relational payload representation)
 
 Run 'pqs datastore COMMAND --help[-verbose]' for more information on a command.
 """
@@ -527,7 +528,8 @@ Options:
         "  ledger    Daml ledger",
         "",
         "Available targets:",
-        "  postgres-document    Postgres database (w/ document payload representation)",
+        "  postgres-document      Postgres database (w/ document payload representation)",
+        "  postgres-relational    Postgres database (w/ relational payload representation)",
         "",
         "Options:",
         paddedOptionLine(
@@ -703,7 +705,8 @@ Options:
         "  ledger    Daml ledger",
         "",
         "Available targets:",
-        "  postgres-document    Postgres database (w/ document payload representation)",
+        "  postgres-document      Postgres database (w/ document payload representation)",
+        "  postgres-relational    Postgres database (w/ relational payload representation)",
         "",
         "Options:",
         paddedOptionLine("  --config file", "Path to configuration overrides via an external HOCON file (optional)"),
