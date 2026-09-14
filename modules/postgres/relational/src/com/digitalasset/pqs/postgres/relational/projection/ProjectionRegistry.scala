@@ -62,6 +62,9 @@ object ProjectionRegistry:
       .selectOne
       .map(_.flatten)
 
+  def retireDrafts: ZIO[ZConnection, Throwable, Unit] =
+    sql"update __query_projection set status = 'retired' where status = 'draft'".update.unit
+
   def getActive: ZIO[ZConnection, Throwable, Option[Row]] =
     sql"""select projection_version, status::text, definition_hash, backfilled_through_ix, definition::text
           from __query_projection where status = 'active'"""
