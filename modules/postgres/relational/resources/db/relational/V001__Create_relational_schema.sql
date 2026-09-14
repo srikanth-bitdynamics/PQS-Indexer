@@ -47,6 +47,7 @@ create table __rel_entity (
     entity_name  text not null,
     kind         rel_entity_kind not null,
     aliases      text[] not null default '{}',
+    base_table   text,
     unique (package_name, module_name, entity_name, kind)
 );
 

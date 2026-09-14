@@ -27,7 +27,8 @@ object specific:
       effectiveAt: Option[Instant],
       workflowId: Option[String],
       externalTransactionHash: Option[Array[Byte]],
-      paidTrafficCost: Option[Long]
+      paidTrafficCost: Option[Long],
+      synchronizerId: Option[String]
   ):
     val columns = Seq(
       "tx_ix",
@@ -41,7 +42,7 @@ object specific:
       "paid_traffic_cost"
     )
     val rowValues = model.values(ix)(offset.toSqlValue)(transactionId)(effectiveAt)(Option.empty[Instant])(
-      Option.empty[String]
+      synchronizerId
     )(workflowId)(externalTransactionHash)(paidTrafficCost)
 
   final case class Event(
@@ -91,7 +92,8 @@ object specific:
       contractKey: Option[Value],
       contractKeyHash: Option[Array[Byte]],
       acsDelta: Boolean,
-      sourceKind: model.SourceKind
+      sourceKind: model.SourceKind,
+      synchronizerId: Option[String]
   ):
     val columns = Seq(
       "contract_pk",
@@ -114,7 +116,7 @@ object specific:
     val rowValues =
       model.values(contractPk)(contractId)(templateEntityPk)(representativePackageId)(creationPackageId)(createdAtIx)(
         createdAtOffset
-      )(signatories)(observers)(createWitnesses)(Option.empty[String])(metadata)(contractKey)(contractKeyHash)(
+      )(signatories)(observers)(createWitnesses)(synchronizerId)(metadata)(contractKey)(contractKeyHash)(
         !acsDelta
       )(sourceKind)
 
@@ -151,4 +153,12 @@ object specific:
   final case class TmpLifecycle(contractId: ContractId, archivedTxIx: Long, archivedAtOffset: Option[Long]):
     val columns   = Seq("contract_id", "archived_tx_ix", "archived_at_offset")
     val rowValues = model.values(contractId)(archivedTxIx)(archivedAtOffset)
+
+  final case class ContractPayload(contractPk: IdPlaceholder, payloadJson: Value, metadata: Option[Array[Byte]]):
+    val columns   = Seq("contract_pk", "payload_json", "metadata")
+    val rowValues = model.values(contractPk)(payloadJson)(metadata)
+
+  final case class InterfaceView(contractPk: IdPlaceholder, viewJson: Value):
+    val columns   = Seq("contract_pk", "view_json")
+    val rowValues = model.values(contractPk)(viewJson)
 end specific
