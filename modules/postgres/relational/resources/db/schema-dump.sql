@@ -296,12 +296,16 @@ CREATE PROCEDURE pqs_relational.__rel_initialize_package(IN package_name text, I
     LANGUAGE plpgsql
     AS $$
 declare
-    pkg bigint;
+    existing_name    text;
+    existing_version text;
 begin
-    select pk from __rel_package pkgs where pkgs.id = package_id into pkg;
-    if pkg is null then
-        insert into __rel_package(name, version, id) values (package_name, package_version, package_id)
-        on conflict (id) do nothing;
+    insert into __rel_package(name, version, id) values (package_name, package_version, package_id)
+    on conflict (id) do nothing;
+    select name, version from __rel_package pkgs where pkgs.id = package_id
+    into existing_name, existing_version;
+    if existing_name is distinct from package_name or existing_version is distinct from package_version then
+        raise exception 'package id % is registered as %:% but was reinitialised as %:%',
+            package_id, existing_name, existing_version, package_name, package_version;
     end if;
 end;
 $$;

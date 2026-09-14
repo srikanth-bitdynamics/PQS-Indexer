@@ -52,5 +52,11 @@ object ProjectionBindingSpec extends ZIOSpecDefault:
           ("status", "text", 2)
         )
       )
+    ,
+    test("rejects two groups that define conflicting columns at the same position"):
+      val conflicting =
+        """{"a":{"Finance:Main:Asset":[{"name":"owner","type":"text","nullable":false,"position":0}]},
+           "b":{"Finance:Main:Asset":[{"name":"amount","type":"bigint","nullable":false,"position":0}]}}"""
+      assertTrue(scala.util.Try(ProjectionBinding.parse(conflicting)).isFailure)
   )
 end ProjectionBindingSpec
