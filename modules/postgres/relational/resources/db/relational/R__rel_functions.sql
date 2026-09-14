@@ -35,12 +35,10 @@ $$
 declare
     pkg bigint;
 begin
-    select pk from __rel_package pkgs
-    where pkgs.name = package_name and pkgs.version = package_version and pkgs.id = package_id
-    into pkg;
+    select pk from __rel_package pkgs where pkgs.id = package_id into pkg;
     if pkg is null then
         insert into __rel_package(name, version, id) values (package_name, package_version, package_id)
-        on conflict (name, version, id) do nothing;
+        on conflict (id) do nothing;
     end if;
 end;
 $$ language plpgsql;

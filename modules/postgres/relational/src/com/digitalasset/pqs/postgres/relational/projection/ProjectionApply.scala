@@ -61,7 +61,7 @@ object ProjectionApply:
 
   def apply(config: Map[String, ProjectionDefinition], schema: Schema): ZIO[ZConnection, Throwable, Outcome] =
     val p = plan(config, schema)
-    sql"select 1 from pg_advisory_xact_lock(${projectionLockKey})".query[Int].selectOne *>
+    sql"select 1 from pg_advisory_xact_lock(${ProjectionRegistry.projectionLockKey})".query[Int].selectOne *>
       ProjectionRegistry.getByHash(p.hash).flatMap {
         case Some(row) => ZIO.succeed(Outcome.AlreadyApplied(row.version, p.diagnostics))
         case None =>
@@ -70,8 +70,6 @@ object ProjectionApply:
               .insertDraft(p.definition, p.hash, p.resolvedShape, layout)
               .map(version => Outcome.Applied(version, p.columns.size, p.diagnostics))
       }
-
-  private val projectionLockKey = 0x70716a5f70726f6aL
 
   def render(outcome: Outcome): String =
     val (headline, diagnostics) = outcome match

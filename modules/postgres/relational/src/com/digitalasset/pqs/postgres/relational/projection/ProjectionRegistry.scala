@@ -5,6 +5,8 @@ import zio.ZIO
 import zio.jdbc.*
 
 object ProjectionRegistry:
+  val projectionLockKey: Long = 0x70716a5f70726f6aL
+
   final case class Row(
       version: Long,
       status: String,
@@ -77,8 +79,17 @@ object ProjectionRegistry:
 
   def activate(version: Long): ZIO[ZConnection, Throwable, Unit] =
     for
-      _ <- sql"update __query_projection set status = 'retired' where status = 'active'".update
-      _ <- sql"""update __query_projection set status = 'active', activated_at = now()
-                 where projection_version = $version""".update
+      _       <- sql"select 1 from pg_advisory_xact_lock(${projectionLockKey})".query[Int].selectOne
+      _       <- sql"update __query_projection set status = 'retired' where status = 'active'".update
+      updated <- sql"""update __query_projection set status = 'active', activated_at = now()
+                       where projection_version = $version and status = 'draft'""".update
+      _ <- updated.compareTo(1L) match
+        case 0 => ZIO.unit
+        case _ =>
+          ZIO.fail(
+            new RuntimeException(
+              s"cannot activate projection version $version: no draft version with that id is pending activation"
+            )
+          )
     yield ()
 end ProjectionRegistry

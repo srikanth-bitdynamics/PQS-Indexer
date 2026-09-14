@@ -18,8 +18,9 @@ object ProjectionBinding:
       .obj
       .values
       .flatMap(_.obj)
-      .map((qualified, cols) => qualified -> toShape(qualified, cols.arr.map(fieldOf).toSeq))
-      .toMap
+      .map((qualified, cols) => qualified -> cols.arr.map(fieldOf).toSeq)
+      .groupMapReduce(_._1)(_._2)(_ ++ _)
+      .map((qualified, fields) => qualified -> toShape(qualified, fields.distinctBy(_.position).sortBy(_.position)))
 
   private def fieldOf(v: Value): Shape.PromotedField =
     Shape.PromotedField(
