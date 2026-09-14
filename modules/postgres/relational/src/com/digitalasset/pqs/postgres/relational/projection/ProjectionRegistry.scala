@@ -19,6 +19,7 @@ object ProjectionRegistry:
   def insertDraft(
       definition: Value,
       hash: String,
+      resolvedShape: Value,
       encodingFlags: Value,
       layout: Int
   ): ZIO[ZConnection, Throwable, Long] =
@@ -28,9 +29,10 @@ object ProjectionRegistry:
         .selectOne
         .map(_.getOrElse(1L))
       _ <- sql"""insert into __query_projection
-                   (projection_version, definition, definition_hash, encoding_flags, layout, status, created_at)
-                 values ($next, ${ujson.write(definition)}::jsonb, $hash, ${ujson.write(encodingFlags)}::jsonb,
-                         $layout, 'draft'::rel_projection_status, now())""".update
+                   (projection_version, definition, definition_hash, resolved_shape, encoding_flags, layout,
+                    status, created_at)
+                 values ($next, ${ujson.write(definition)}::jsonb, $hash, ${ujson.write(resolvedShape)}::jsonb,
+                         ${ujson.write(encodingFlags)}::jsonb, $layout, 'draft'::rel_projection_status, now())""".update
     yield next
 
   def list: ZIO[ZConnection, Throwable, Seq[Row]] =
@@ -43,6 +45,13 @@ object ProjectionRegistry:
   def get(version: Long): ZIO[ZConnection, Throwable, Option[Row]] =
     sql"""select projection_version, status::text, definition_hash, backfilled_through_ix, definition::text
           from __query_projection where projection_version = $version"""
+      .query[(Long, String, String, Option[Long], String)]
+      .selectOne
+      .map(_.map(toRow))
+
+  def getByHash(hash: String): ZIO[ZConnection, Throwable, Option[Row]] =
+    sql"""select projection_version, status::text, definition_hash, backfilled_through_ix, definition::text
+          from __query_projection where definition_hash = $hash"""
       .query[(Long, String, String, Option[Long], String)]
       .selectOne
       .map(_.map(toRow))
