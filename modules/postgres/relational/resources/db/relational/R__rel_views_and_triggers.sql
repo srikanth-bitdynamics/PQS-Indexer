@@ -1,6 +1,3 @@
--- Copyright (c) 2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
--- SPDX-License-Identifier: Apache-2.0
-
 create or replace function __rel_current_writer() returns __rel_watermark.instance_id%type
 as $$ select instance_id from __rel_watermark limit 1 $$
 language sql;

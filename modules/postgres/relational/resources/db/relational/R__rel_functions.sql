@@ -1,6 +1,3 @@
--- Copyright (c) 2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
--- SPDX-License-Identifier: Apache-2.0
-
 create or replace procedure __rel_initialize_package(package_name text, package_version text, package_id text) as
 $$
 declare

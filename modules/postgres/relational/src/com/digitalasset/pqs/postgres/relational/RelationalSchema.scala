@@ -1,6 +1,3 @@
-// Copyright (c) 2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
-
 package com.digitalasset.pqs.postgres.relational
 
 import com.digitalasset.pqs.o11y.traces
@@ -10,8 +7,9 @@ import org.flywaydb.core.Flyway
 import org.flywaydb.core.api.ResourceProvider
 import org.flywaydb.core.api.resource.LoadableResource
 import org.flywaydb.core.internal.jdbc.DriverDataSource
-import zio.ZIO.logInfo
-import zio.{Task, ZIO}
+import zio.ZIO.{logInfo, logTrace}
+import zio.ZIO
+import zio.jdbc.*
 
 import java.io.{Reader, StringReader}
 import java.util
@@ -21,7 +19,11 @@ import scala.util.Using
 object RelationalSchema:
   private val migrationPath = "db/relational"
 
-  def applySchema(pgCfg: PostgresConfig, instanceId: InstanceId, doBaseline: Boolean): Task[Unit] =
+  def applySchema(
+      pgCfg: PostgresConfig,
+      instanceId: InstanceId,
+      doBaseline: Boolean
+  ): ZIO[ZConnectionPool & RelSqlSchema, Throwable, Unit] =
     traces.span("apply relational schema") {
       logInfo("Applying relational schema") *>
         ZIO.attemptBlocking {
@@ -37,6 +39,8 @@ object RelationalSchema:
                 (sslprops(pgCfg.tls) ++ instanceIdProp(instanceId)).asJava
               )
             )
+            .schemas(pgCfg.schema)
+            .createSchemas(true)
             .baselineOnMigrate(doBaseline)
             .baselineVersion("001")
             .baselineDescription("Baseline relational schema")
@@ -68,5 +72,8 @@ object RelationalSchema:
             .load()
             .migrate()
         }.unit
+    } *> traces.span("apply relational mappings") {
+      logInfo("Applying relational mappings") *>
+        ZIO.serviceWithZIO[RelSqlSchema](schema => logTrace(schema.mappings) *> transaction(schema.mappings.execute))
     } <* logInfo("Relational schema applied")
 end RelationalSchema
