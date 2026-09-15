@@ -20,10 +20,7 @@ import com.digitalasset.pqs.postgres.relational.projection.{
   ProjectionRegistry,
   Shape
 }
-import com.digitalasset.transcode.Codec
-import com.digitalasset.transcode.codec.json.JsonCodec
 import com.digitalasset.transcode.schema.{Dictionary, Schema}
-import ujson.Value
 import zio.config.magnolia.{Descriptor, describe}
 import zio.jdbc.*
 import zio.{ZIO, ZLayer}
@@ -159,7 +156,7 @@ object Main extends ComposableApp:
 
   private def projectionBackfill(config: ZLayer[Any, Throwable, ConfigProjectionBackfill]) =
     (for
-      codec <- ZIO.service[Dictionary[Codec[Value]]]
+      schema <- ZIO.service[Schema]
       message <- transaction(
         ProjectionRegistry.latestDraft.flatMap {
           case None => ZIO.succeed("No draft projection to backfill")
@@ -167,7 +164,7 @@ object Main extends ComposableApp:
             for
               shapeJson <- ProjectionRegistry.resolvedShapeOf(version)
               shapes = shapeJson.fold(Map.empty[String, Shape.ResolvedShape])(ProjectionBinding.parse)
-              through <- ProjectionBackfill.run(codec, shapes, version)
+              through <- ProjectionBackfill.run(schema, shapes, version)
               _       <- ProjectionRegistry.setBackfilledThrough(version, through)
             yield s"Backfilled projection version $version through tx_ix $through"
         }
@@ -183,9 +180,7 @@ object Main extends ComposableApp:
         config.project(_.postgres),
         backend.instanceId,
         backend.connectionPool,
-        DamlSchema.schema,
-        ZLayer.succeed[ContractFilter](ContractFilter(IdentifierFilter.AcceptAll)),
-        DamlSchema.produce(JsonCodec()).update(_.matchByPackageId)
+        DamlSchema.schema
       )
       .bootstrap(config.project(_.logger).orElse(FileLogging.default) >>> com.digitalasset.pqs.cli.bootstrap)
 
