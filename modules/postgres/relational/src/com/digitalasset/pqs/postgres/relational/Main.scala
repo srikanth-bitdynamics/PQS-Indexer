@@ -25,7 +25,7 @@ import zio.config.magnolia.{Descriptor, describe}
 import zio.jdbc.*
 import zio.{ZIO, ZLayer}
 
-object Main extends ComposableApp:
+object Main extends RelationalIndexCli:
   def app =
     "postgres-relational"
       @@ Command("Perform operations supporting Postgres database (w/ relational payload representation)")
@@ -101,7 +101,8 @@ object Main extends ComposableApp:
 
   private def appProjection =
     "projection" @@ Command("Manage relational typed-column projections")
-      - (appProjectionApply | appProjectionBackfill | appProjectionActivate | appProjectionList | appProjectionShow)
+      - (appProjectionApply | appProjectionBackfill | appProjectionActivate | appProjectionList | appProjectionShow
+        | indexCommand)
 
   private def appProjectionApply = (
     "apply" @@ Command("Resolve the configured projection, add typed columns and record a draft version")
