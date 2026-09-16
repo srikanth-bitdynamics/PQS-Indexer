@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package com.digitalasset.pqs.schema.postgres.relational
 
 import com.digitalasset.pqs.SharedLedgerAndPostgresTest
@@ -29,7 +32,7 @@ object RelationalReadSurfaceSpec extends SharedLedgerAndPostgresTest:
   )
 
   def spec = suite("relational read surface spec")(
-    funcTest("the transactions view hides rows committed past the published watermark") {
+    funcTest("public reads respect the watermark, historical offsets and redaction markers") {
       val alice = Party("Alice")
       Given:
         DamlSdk.dar(note) ++ DamlSdk.parties(alice) ++ Postgres.database >+> DamlSdk.deploy
@@ -56,10 +59,31 @@ object RelationalReadSurfaceSpec extends SharedLedgerAndPostgresTest:
             viewMax   <- sql"select max(ledger_offset) from transactions".query[Option[Long]].selectOne.map(_.flatten)
             rawCount  <- sql"select count(*) from __rel_transactions".query[Long].selectOne.map(_.getOrElse(0L))
             viewCount <- sql"select count(*) from transactions".query[Long].selectOne.map(_.getOrElse(0L))
+            _ <- sql"select set_config('pqs.session_offset_latest', ${future.toString}, true)".query[String].selectOne
+            explicitMax <- sql"select max(ledger_offset) from transactions".query[Option[Long]].selectOne.map(_.flatten)
+            firstOffset <- sql"select min(ledger_offset) from __rel_transactions"
+              .query[Long]
+              .selectOne
+              .map(_.getOrElse(0L))
+            _ <- sql"select set_config('pqs.session_offset_latest', ${firstOffset.toString}, true)"
+              .query[String]
+              .selectOne
+            historicalMax <- sql"select max(ledger_offset) from transactions"
+              .query[Option[Long]]
+              .selectOne
+              .map(_.flatten)
+            _            <- sql"select set_config('pqs.session_offset_latest', '', true)".query[String].selectOne
+            activeBefore <- sql"select count(*) from active_contracts".query[Long].selectOne.map(_.getOrElse(0L))
+            _            <- sql"update __rel_contracts set redaction_id = 'review-redaction'".update
+            activeAfter  <- sql"select count(*) from active_contracts".query[Long].selectOne.map(_.getOrElse(0L))
           yield assertTrue(
             rawMax == Some(future),
             viewMax == Some(watermark),
-            rawCount == viewCount + 1
+            rawCount == viewCount + 1,
+            explicitMax == Some(watermark),
+            historicalMax == Some(firstOffset),
+            activeBefore > 0,
+            activeAfter == 0
           )
         )
     }

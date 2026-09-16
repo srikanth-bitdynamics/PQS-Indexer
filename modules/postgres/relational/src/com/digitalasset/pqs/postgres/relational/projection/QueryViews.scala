@@ -1,19 +1,22 @@
+// Copyright (c) 2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package com.digitalasset.pqs.postgres.relational.projection
 
 import zio.ZIO
 import zio.jdbc.*
 
 object QueryViews:
-  private val baseColumns: Seq[SqlFragment] = Seq(
-    "c.contract_id",
-    "c.representative_package_id",
-    "c.creation_package_id",
-    "c.created_tx_ix",
-    "c.created_at_offset",
-    "c.creation_synchronizer_id",
-    "c.signatories",
-    "c.observers"
-  ).map(SqlFragment(_))
+  private val baseColumns = Seq(
+    "contract_id",
+    "representative_package_id",
+    "creation_package_id",
+    "created_tx_ix",
+    "created_at_offset",
+    "creation_synchronizer_id",
+    "signatories",
+    "observers"
+  )
 
   def publish(active: Map[String, Shape.ResolvedShape]): ZIO[ZConnection, Throwable, Unit] =
     sql"""select package_name, module_name, entity_name, base_table, query_view
@@ -22,25 +25,52 @@ object QueryViews:
       .selectAll
       .flatMap(entities =>
         ZIO.foreachDiscard(entities) { (pkg, module, entity, base, view) =>
-          active.get(s"$pkg:$module:$entity") match
-            case Some(shape) => drop(view) *> create(view, base, shape)
-            case None        => drop(view)
+          for
+            existing <- sql"""select a.attname from pg_attribute a
+                              join pg_class c on c.oid = a.attrelid
+                              join pg_namespace n on n.oid = c.relnamespace
+                              where n.nspname = current_schema() and c.relname = $view
+                                and a.attnum > 0 and not a.attisdropped order by a.attnum"""
+              .query[String]
+              .selectAll
+            _ <- active.get(s"$pkg:$module:$entity") match
+              case Some(shape)              => create(view, base, shape, existing.toSeq)
+              case None if existing.isEmpty => ZIO.unit
+              case None                     => incompatible(view, existing.toSeq)
+          yield ()
         }
       )
 
-  private def create(view: String, base: String, shape: Shape.ResolvedShape): ZIO[ZConnection, Throwable, Unit] =
-    val typed  = shape.promoted.map(f => SqlFragment(s"p.${quoteIdent(f.name)}"))
-    val select = (baseColumns ++ typed :+ SqlFragment("p.payload_json")).mkFragment(sql", ")
-    (SqlFragment(s"create view ${view} as select ") ++ select ++
-      SqlFragment(s""" from ${base} p
+  private def create(
+      view: String,
+      base: String,
+      shape: Shape.ResolvedShape,
+      existing: Seq[String]
+  ): ZIO[ZConnection, Throwable, Unit] =
+    val columns = baseColumns ++ shape.promoted.map(_.name) :+ "payload_json"
+    val removed = existing.filterNot(columns.contains)
+    if removed.nonEmpty then incompatible(view, removed)
+    else
+      val ordered = existing ++ columns.filterNot(existing.contains)
+      val select = ordered
+        .map { name =>
+          SqlFragment(s"${if baseColumns.contains(name) then "c" else "p"}.${quoteIdent(name)}")
+        }
+        .mkFragment(sql", ")
+      (SqlFragment(s"create or replace view ${quoteIdent(view)} as select ") ++ select ++
+        SqlFragment(s""" from ${quoteIdent(base)} p
                        join __rel_contracts c on c.contract_pk = p.contract_pk
                        where c.created_tx_ix <= latest_ix()
                          and c.life_ix @> latest_ix()
                          and c.redaction_id is null
                          and not c.divulged_only""")).execute.unit
 
-  private def drop(view: String): ZIO[ZConnection, Throwable, Unit] =
-    SqlFragment(s"drop view if exists ${view}").execute.unit
+  private def incompatible(view: String, removed: Seq[String]): ZIO[Any, Throwable, Nothing] =
+    ZIO.fail(
+      new IllegalArgumentException(
+        s"cannot republish $view: removing published columns (${removed.mkString(", ")}) requires an explicit consumer migration"
+      )
+    )
 
   private def quoteIdent(name: String): String = "\"" + name.replace("\"", "\"\"") + "\""
 end QueryViews

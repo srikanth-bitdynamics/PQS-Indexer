@@ -12,7 +12,11 @@ import com.daml.ledger.api.v2.admin.party_management_service.*
 import com.daml.ledger.api.v2.admin.user_management_service
 import com.daml.ledger.api.v2.admin.user_management_service.Right.Kind
 import com.daml.ledger.api.v2.admin.user_management_service.ZioUserManagementService.UserManagementServiceClient
-import com.daml.ledger.api.v2.admin.user_management_service.{CreateUserRequest, GrantUserRightsRequest}
+import com.daml.ledger.api.v2.admin.user_management_service.{
+  CreateUserRequest,
+  GrantUserRightsRequest,
+  RevokeUserRightsRequest
+}
 import com.daml.ledger.api.v2.command_service.ZioCommandService.CommandServiceClient
 import com.daml.ledger.api.v2.command_service.*
 import com.daml.ledger.api.v2.commands.*
@@ -139,10 +143,18 @@ object Ledger:
     )
   )
 
-  def grantRights(partyId: String) = svc(
+  def grantRights(partyId: String, userId: String = CantonConf.participantAdmin) = svc(
     UserManagementServiceClient.grantUserRights(
       GrantUserRightsRequest.defaultInstance
-        .withUserId(CantonConf.participantAdmin)
+        .withUserId(userId)
+        .addRights(user_management_service.Right(Kind.CanActAs(user_management_service.Right.CanActAs(partyId))))
+    )
+  )
+
+  def revokeRights(partyId: String, userId: String) = svc(
+    UserManagementServiceClient.revokeUserRights(
+      RevokeUserRightsRequest.defaultInstance
+        .withUserId(userId)
         .addRights(user_management_service.Right(Kind.CanActAs(user_management_service.Right.CanActAs(partyId))))
     )
   )

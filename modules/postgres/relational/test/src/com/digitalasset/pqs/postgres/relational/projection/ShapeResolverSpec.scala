@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package com.digitalasset.pqs.postgres.relational.projection
 
 import com.digitalasset.transcode.schema.*
@@ -55,6 +58,48 @@ object ShapeResolverSpec extends ZIOSpecDefault:
         shape.jsonOnly == Seq("x"),
         shape.diagnostics.exists(_.contains("diverges"))
       )
+    ,
+    test("SQL text storage does not make different Daml types compatible"):
+      val alternatives = Seq(Descriptor.text, Descriptor.party, Descriptor.contractId(Descriptor.party), statusEnum)
+      val shapes = for
+        (a, i) <- alternatives.zipWithIndex
+        (b, j) <- alternatives.zipWithIndex if i != j
+      yield Shape
+        .resolveAll(
+          Dictionary.make(
+            tmpl(id("p1", "1.0.0", "Rec"), Seq("x" -> a)),
+            tmpl(id("p2", "2.0.0", "Rec"), Seq("x" -> b))
+          )
+        )
+        .values
+        .head
+      assertTrue(shapes.forall(s => s.promoted.isEmpty && s.diagnostics.nonEmpty))
+    ,
+    test("a required field absent in another version stays in JSON"):
+      val shape = Shape
+        .resolveAll(
+          Dictionary.make(
+            tmpl(id("p1", "1.0.0", "Rec"), Seq.empty),
+            tmpl(id("p2", "2.0.0", "Rec"), Seq("x" -> Descriptor.text))
+          )
+        )
+        .values
+        .head
+      assertTrue(shape.promoted.isEmpty, shape.jsonOnly == Seq("x"))
+    ,
+    test("an optional trailing field can be absent and return without changing its binding"):
+      val fields = Seq("x" -> Descriptor.optional(Descriptor.text))
+      val shape = Shape
+        .resolveAll(
+          Dictionary.make(
+            tmpl(id("p1", "1.0.0", "Rec"), fields),
+            tmpl(id("p2", "2.0.0", "Rec"), Seq.empty),
+            tmpl(id("p3", "3.0.0", "Rec"), fields)
+          )
+        )
+        .values
+        .head
+      assertTrue(shape.promoted.map(_.name) == Seq("x"), shape.promoted.head.nullable)
     ,
     test("an interface entity resolves under the Interface kind"):
       val iface = tmpl(id("i1", "1.0.0", "IAsset"), Seq("owner" -> Descriptor.party), isInterface = true)

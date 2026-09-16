@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package com.digitalasset.pqs.postgres.relational
 
 import com.digitalasset.auth
@@ -6,12 +9,7 @@ import com.digitalasset.canonical.{ContractFilter, MetadataFilter, given}
 import com.digitalasset.pqs.app.*
 import com.digitalasset.pqs.logging.FileLogging
 import com.digitalasset.pqs.postgres.backend
-import com.digitalasset.transcode.schema.IdentifierFilter
-import com.digitalasset.zio.daml
-import com.digitalasset.zio.daml.{DamlSchema, LedgerScope}
-import com.digitalasset.zio.daml.ledgerapi.PackageService
-import zio.Console.printLine
-import zio.ZIO.{logInfo, logTrace, serviceWithZIO}
+import com.digitalasset.pqs.postgres.backend.{transact as transaction}
 import com.digitalasset.pqs.postgres.relational.projection.{
   ProjectionApply,
   ProjectionBackfill,
@@ -21,7 +19,12 @@ import com.digitalasset.pqs.postgres.relational.projection.{
   ProjectionRegistry,
   Shape
 }
-import com.digitalasset.transcode.schema.{Dictionary, Schema}
+import com.digitalasset.transcode.schema.{Dictionary, IdentifierFilter, Schema}
+import com.digitalasset.zio.daml
+import com.digitalasset.zio.daml.{DamlSchema, LedgerScope}
+import com.digitalasset.zio.daml.ledgerapi.PackageService
+import zio.Console.printLine
+import zio.ZIO.{logInfo, logTrace, serviceWithZIO}
 import zio.config.magnolia.{Descriptor, describe}
 import zio.jdbc.*
 import zio.{ZIO, ZLayer}

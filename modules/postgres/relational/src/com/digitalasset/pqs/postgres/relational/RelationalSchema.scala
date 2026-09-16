@@ -1,7 +1,11 @@
+// Copyright (c) 2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package com.digitalasset.pqs.postgres.relational
 
 import com.digitalasset.pqs.o11y.traces
 import com.digitalasset.pqs.postgres.backend.*
+import com.digitalasset.pqs.postgres.backend.{transact as transaction}
 import io.github.classgraph.ClassGraph
 import org.flywaydb.core.Flyway
 import org.flywaydb.core.api.ResourceProvider

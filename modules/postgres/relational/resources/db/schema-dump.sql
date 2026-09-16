@@ -1,3 +1,6 @@
+-- Copyright (c) 2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
 --
 -- PostgreSQL database dump
 --
@@ -443,10 +446,9 @@ begin
     from drained d
     where c.contract_id = d.contract_id and c.archived_tx_ix is null;
 
-    -- advance this writer's coverage so through_offset tracks committed progress, not the ledger end sampled at startup
     update __query_coverage
     set through_offset = new.ledger_offset
-    where instance_id = new.instance_id;
+    where instance_id = new.instance_id and completed_at is null;
 
     return new;
 end;
@@ -482,11 +484,8 @@ $$;
 CREATE FUNCTION pqs_relational.latest_offset() RETURNS bigint
     LANGUAGE sql STABLE PARALLEL SAFE
     AS $$
-    select case
-               when coalesce(current_setting('pqs.session_offset_latest', true), '') = ''
-                   then (select ledger_offset from latest_checkpoint())
-               else current_setting('pqs.session_offset_latest', false)::bigint
-           end;
+    select least(nullif(current_setting('pqs.session_offset_latest', true), '')::bigint, ledger_offset)
+    from latest_checkpoint();
 $$;
 
 
@@ -859,7 +858,8 @@ CREATE TABLE pqs_relational.__rel_managed_index (
     adopted boolean DEFAULT false NOT NULL,
     covered_query_shapes text[],
     created_at timestamp with time zone NOT NULL,
-    validated_at timestamp with time zone
+    validated_at timestamp with time zone,
+    physical_oid oid
 );
 
 
@@ -1012,7 +1012,7 @@ CREATE VIEW pqs_relational.active_contracts AS
     observers,
     creation_synchronizer_id
    FROM pqs_relational.__rel_contracts c
-  WHERE ((life_ix @> pqs_relational.latest_ix()) AND (NOT divulged_only));
+  WHERE ((life_ix @> pqs_relational.latest_ix()) AND (NOT divulged_only) AND (redaction_id IS NULL));
 
 
 --

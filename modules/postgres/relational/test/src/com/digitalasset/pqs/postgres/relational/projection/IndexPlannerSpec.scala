@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package com.digitalasset.pqs.postgres.relational.projection
 
 import com.digitalasset.pqs.postgres.relational.projection.IndexPlanner.*
@@ -59,5 +62,12 @@ object IndexPlannerSpec extends ZIOSpecDefault:
     test("ignores an empty query without producing an index or a diagnostic"):
       val result = IndexPlanner.plan(Seq(ProjectionQuery()), Set("owner"))
       assertTrue(result.indexes.isEmpty, result.diagnostics.isEmpty)
+    ,
+    test("equality-constrained and repeated ordering columns do not enlarge an index"):
+      val result = IndexPlanner.plan(
+        Seq(ProjectionQuery(Seq("owner"), Seq("owner desc", "amount desc", "amount asc"))),
+        Set("owner", "amount")
+      )
+      assertTrue(result.indexes == Seq(IndexSpec(Seq("owner"), Seq(OrderKey("amount", false)))))
   )
 end IndexPlannerSpec

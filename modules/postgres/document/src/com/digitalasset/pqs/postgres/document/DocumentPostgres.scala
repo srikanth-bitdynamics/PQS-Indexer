@@ -11,6 +11,7 @@ import com.digitalasset.pqs.o11y.metrics.latency
 import com.digitalasset.pqs.o11y.traces
 import com.digitalasset.pqs.o11y.traces.given
 import com.digitalasset.pqs.postgres.backend.*
+import com.digitalasset.pqs.postgres.backend.{transact as transaction}
 import com.digitalasset.pqs.postgres.document.model.{EntityTypePk, PackagePk, Watermark}
 import com.digitalasset.pqs.postgres.document.specific.*
 import com.digitalasset.transcode.Codec
@@ -52,9 +53,10 @@ final case class DocumentPostgres(
 
   private val Genesis: Datastore.Checkpoint = (Offset.Genesis, 0L)
   private val env                           = ZEnvironment(pool) ++ ZEnvironment(poolConfig)
-  private val tx                            = ZLayer.succeedEnvironment(env) >>> transaction
-  private val BatchEntitiesThreshold        = 10_000
-  private val BatchReleaseWindow            = 200.millis
+  private def tx[A](effect: ZIO[ZConnection, Throwable, A]): ZIO[Any, Throwable, A] =
+    transaction(effect).provideEnvironment(env)
+  private val BatchEntitiesThreshold = 10_000
+  private val BatchReleaseWindow     = 200.millis
 
   override def registerActiveWriterAndCleanupTransactions = tx(
     sql"call __cleanup_transactions_after_watermark()".execute

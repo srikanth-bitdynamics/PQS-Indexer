@@ -1,3 +1,6 @@
+-- Copyright (c) 2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
 create or replace function __rel_typed_table_name(
     package_name text,
     module_name text,
@@ -259,11 +262,8 @@ $$ language sql stable;
 
 create or replace function latest_offset() returns bigint as
 $$
-    select case
-               when coalesce(current_setting('pqs.session_offset_latest', true), '') = ''
-                   then (select ledger_offset from latest_checkpoint())
-               else current_setting('pqs.session_offset_latest', false)::bigint
-           end;
+    select least(nullif(current_setting('pqs.session_offset_latest', true), '')::bigint, ledger_offset)
+    from latest_checkpoint();
 $$ language sql stable parallel safe;
 
 create or replace function oldest_offset() returns bigint as

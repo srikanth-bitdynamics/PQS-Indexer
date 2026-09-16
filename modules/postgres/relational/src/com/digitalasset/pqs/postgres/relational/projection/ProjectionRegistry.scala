@@ -1,5 +1,9 @@
+// Copyright (c) 2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package com.digitalasset.pqs.postgres.relational.projection
 
+import com.digitalasset.pqs.postgres.relational.WriterFence
 import ujson.Value
 import zio.ZIO
 import zio.jdbc.*
@@ -66,20 +70,19 @@ object ProjectionRegistry:
   def retireDrafts: ZIO[ZConnection, Throwable, Unit] =
     sql"update __query_projection set status = 'retired' where status = 'draft'".update.unit
 
-  def getActive: ZIO[ZConnection, Throwable, Option[Row]] =
-    sql"""select projection_version, status::text, definition_hash, backfilled_through_ix, definition::text
-          from __query_projection where status = 'active'"""
-      .query[(Long, String, String, Option[Long], String)]
-      .selectOne
-      .map(_.map(toRow))
-
   def resolvedShapeOf(version: Long): ZIO[ZConnection, Throwable, Option[String]] =
     sql"select resolved_shape::text from __query_projection where projection_version = $version"
       .query[String]
       .selectOne
 
   def setBackfilledThrough(version: Long, throughIx: Long): ZIO[ZConnection, Throwable, Unit] =
-    sql"update __query_projection set backfilled_through_ix = $throughIx where projection_version = $version".update.unit
+    sql"select 1 from pg_advisory_xact_lock($projectionLockKey)".query[Int].selectOne *>
+      sql"""update __query_projection set backfilled_through_ix = $throughIx
+             where projection_version = $version and status = 'draft'""".update
+        .flatMap(_.compareTo(1L) match
+          case 0 => ZIO.unit
+          case _ => ZIO.fail(new IllegalStateException(s"projection $version is no longer a pending draft"))
+        )
 
   def activate(version: Long): ZIO[ZConnection, Throwable, Unit] =
     for
@@ -96,6 +99,7 @@ object ProjectionRegistry:
               "cannot activate projection: a relational ingest writer is live; stop the writer, then re-run activate"
             )
           )
+      _ <- WriterFence.drain
       _ <- ensureBackfilled(version)
       _ <- sql"update __query_projection set status = 'retired' where status = 'active'".update
       updated <- sql"""update __query_projection set status = 'active', activated_at = now()

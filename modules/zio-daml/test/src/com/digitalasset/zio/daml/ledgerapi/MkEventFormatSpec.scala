@@ -122,6 +122,11 @@ object MkEventFormatSpec extends ZIOSpecDefault:
                     )
                   ),
                   CumulativeFilter(
+                    CumulativeFilter.IdentifierFilter.TemplateFilter(
+                      TemplateFilter(templateId = Some(template1.toRefId), includeCreatedEventBlob = true)
+                    )
+                  ),
+                  CumulativeFilter(
                     CumulativeFilter.IdentifierFilter.InterfaceFilter(
                       InterfaceFilter(
                         interfaceId = Some(interface1.toRefId),
@@ -179,6 +184,11 @@ object MkEventFormatSpec extends ZIOSpecDefault:
                   CumulativeFilter(
                     CumulativeFilter.IdentifierFilter.WildcardFilter(
                       WildcardFilter(includeCreatedEventBlob = false)
+                    )
+                  ),
+                  CumulativeFilter(
+                    CumulativeFilter.IdentifierFilter.TemplateFilter(
+                      TemplateFilter(templateId = Some(template1.toRefId), includeCreatedEventBlob = false)
                     )
                   ),
                   CumulativeFilter(
@@ -246,6 +256,11 @@ object MkEventFormatSpec extends ZIOSpecDefault:
                   CumulativeFilter(
                     CumulativeFilter.IdentifierFilter.WildcardFilter(
                       WildcardFilter(includeCreatedEventBlob = false)
+                    )
+                  ),
+                  CumulativeFilter(
+                    CumulativeFilter.IdentifierFilter.TemplateFilter(
+                      TemplateFilter(templateId = Some(template1.toRefId), includeCreatedEventBlob = false)
                     )
                   ),
                   CumulativeFilter(
@@ -492,6 +507,11 @@ object MkEventFormatSpec extends ZIOSpecDefault:
             CumulativeFilter(
               CumulativeFilter.IdentifierFilter.WildcardFilter(
                 WildcardFilter(includeCreatedEventBlob = false)
+              )
+            ),
+            CumulativeFilter(
+              CumulativeFilter.IdentifierFilter.TemplateFilter(
+                TemplateFilter(templateId = Some(template1.toRefId), includeCreatedEventBlob = false)
               )
             ),
             CumulativeFilter(
