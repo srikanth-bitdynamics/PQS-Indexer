@@ -129,4 +129,15 @@ object RelationalModelSpec extends ZIOSpecDefault:
         RelSqlSchema.lit("Token'Name") == "'Token''Name'",
         RelSqlSchema.lit("a'b'c") == "'a''b''c'"
       )
+    ,
+    test("schema show emits the callback, versioned schema and dependent repeatables in apply order"):
+      val script    = RelSqlSchema.collect(Seq.empty).schema
+      val callback  = script.indexOf("beforeMigrate.sql (start)")
+      val version   = script.indexOf("V001__Create_relational_schema.sql (start)")
+      val functions = script.indexOf("R__rel_functions.sql (start)")
+      val views     = script.indexOf("R__rel_views_and_triggers.sql (start)")
+      assertTrue(callback >= 0, callback < version, version < functions, functions < views)
+    ,
+    test("versioned schema display uses Flyway numeric version ordering"):
+      assertTrue(RelSqlSchema.compareMigrations("V9__Schema.sql", "V10__Schema.sql") < 0)
   )

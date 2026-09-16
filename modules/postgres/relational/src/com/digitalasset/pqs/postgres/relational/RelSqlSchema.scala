@@ -4,7 +4,9 @@
 package com.digitalasset.pqs.postgres.relational
 
 import com.digitalasset.transcode.schema.*
+import com.digitalasset.pqs.utils.safeequals.===
 import io.github.classgraph.{ClassGraph, Resource}
+import org.flywaydb.core.api.MigrationVersion
 
 import java.nio.charset.StandardCharsets
 import scala.util.Using
@@ -30,6 +32,19 @@ object RelSqlSchema extends SchemaVisitor.Unit:
     )
 
   private[relational] def lit(v: Any): String = "'" + v.toString.replace("'", "''") + "'"
+
+  private[relational] def compareMigrations(left: String, right: String): Int =
+    def rank(name: String): Int =
+      if name === "beforeMigrate.sql" then 0 else if name.startsWith("V") then 1 else 2
+    val a     = left.split('/').last
+    val b     = right.split('/').last
+    val group = rank(a).compareTo(rank(b))
+    if group != 0 then group
+    else if rank(a) == 1 then
+      MigrationVersion
+        .fromVersion(a.drop(1).takeWhile(_ != '_'))
+        .compareTo(MigrationVersion.fromVersion(b.drop(1).takeWhile(_ != '_')))
+    else a.compareTo(b)
 
   private def initPackage(id: PackageId, name: PackageName, version: PackageVersion) =
     s"call __rel_initialize_package(${lit(name)}, ${lit(version)}, ${lit(id)});"
@@ -75,7 +90,7 @@ object RelSqlSchema extends SchemaVisitor.Unit:
     Using.Manager { use =>
       val scanResult = use(ClassGraph().acceptPaths("db/relational").scan())
       val migrations = scanResult.getResourcesWithExtension("sql")
-      migrations.sort((a, b) => a.getPath.compareTo(b.getPath))
+      migrations.sort((a, b) => compareMigrations(a.getPath, b.getPath))
       migrations.forEachByteArrayThrowingIOException((res: Resource, content: Array[Byte]) => {
         val path       = res.getPath
         val frameStart = "-- " + ">".repeat(path.length + 8) + " --"
