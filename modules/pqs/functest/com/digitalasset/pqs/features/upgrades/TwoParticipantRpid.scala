@@ -62,21 +62,8 @@ object TwoParticipantRpid:
         |""".stripMargin
   ).upgrades(packageV1)
 
-  /** Two-participant Canton layer with Postgres storage (required for ACS import).
-    *
-    * Uses the captured v1 and v2 DARs, generates two-participant HOCON config + bootstrap script, and starts Canton.
-    * Participant2 is on port 6865 (Pqs-facing), participant1 on port 7865 (internal only).
-    *
-    * The bootstrap script uses canonical offline party replication:
-    *   - Creates the synchronizer and connects both participants
-    *   - Uploads v1 to participant1, v2 to participant2
-    *   - Allocates Alice on participant1
-    *   - Creates a contract on participant1 using v1 template (before replication)
-    *   - Replicates Alice to participant2 with onboarding flag (target proposes, disconnect, source proposes)
-    *   - Exports ACS via parties.export_party_acs, imports via parties.import_party_acs
-    *   - Reconnects participant2 and clears onboarding flag
-    *
-    * This results in participant2 having a contract with v2 as representative package and v1 as creation package.
+  /** Import a v1 contract into a participant using v2, so creation and representative package IDs differ. Postgres
+    * storage is required for ACS import. PQS connects to participant2 on port 6865.
     */
   def cantonParticipantWithACSImportContract(
       alice: Party,

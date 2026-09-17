@@ -115,6 +115,11 @@ package object ledgerapi:
     val entityFilter =
       if damlSchema.includesAll then
         val metadataTemplates = damlSchema.metadata.diff(damlSchema.interfaces)
+        val payloadTemplates = damlSchema.implements.collect {
+          case (id, interfaces) if interfaces.nonEmpty => id
+        }.toSet
+        val explicitTemplates =
+          payloadTemplates ++ (if damlSchema.includesAllMetadata then Set.empty else metadataTemplates)
         Filters.of(
           Seq(
             CumulativeFilter.of(
@@ -123,11 +128,9 @@ package object ledgerapi:
               )
             )
           )
-          // Selective metadata: add TemplateFilter for templates needing blobs
-          // WildcardFilter(blob=false) handles delivery; these add blob via OR
-            ++ (if !damlSchema.includesAllMetadata then
-                  metadataTemplates.map(id => templateCumulativeFilter(id, includeBlob = true)).toSeq
-                else Seq.empty)
+            ++ explicitTemplates.toSeq.sorted.map(id =>
+              templateCumulativeFilter(id, includeBlob = damlSchema.metadata.contains(id))
+            )
             ++ damlSchema.interfaces
               .map(id => interfaceCumulativeFilter(id, includeBlob = damlSchema.metadata.contains(id)))
               .toSeq

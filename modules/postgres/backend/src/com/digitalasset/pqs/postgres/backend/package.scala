@@ -4,6 +4,7 @@
 package com.digitalasset.pqs.postgres
 
 import com.digitalasset.pqs.o11y.traces
+import com.digitalasset.pqs.o11y.metrics.latency
 import com.digitalasset.pqs.postgres.backend.TlsConfig.SslMode
 import org.postgresql.PGProperty
 import zio.jdbc.*
@@ -16,25 +17,30 @@ import java.io.File
 import java.util.concurrent.atomic.AtomicLong
 
 package object backend:
+  /** Return a result only after PostgreSQL has committed it. Commit errors remain in the effect's error channel. */
+  def transact[A](effect: ZIO[ZConnection, Throwable, A]): ZIO[ZConnectionPool, Throwable, A] =
+    transaction(effect <* commitTransaction)
+
+  private val commitTransaction: ZIO[ZConnection, Throwable, Unit] =
+    ZIO.serviceWithZIO[ZConnection](_.access(c => if !c.getAutoCommit then c.commit()))
+      @@ latency("jdbc_conn_commit", "Latency of database connection commit")
+      @@ traces.span("commit transaction")
+
   /** Execute each transaction in parallel */
   def executePar[A](
       n: Int
-  ): ZPipeline[ZConnectionPool & PostgresConfig, Throwable, ZIO[ZConnection, Throwable, A], A] =
-    ZPipeline.serviceWithPipeline[PostgresConfig](config =>
-      ZPipeline[ZIO[ZConnection, Throwable, A]].mapZIOPar(n) { call =>
-        transaction(call) @@ traces.span("execute datastore transaction")
-      }
-    )
+  ): ZPipeline[ZConnectionPool, Throwable, ZIO[ZConnection, Throwable, A], A] =
+    ZPipeline[ZIO[ZConnection, Throwable, A]].mapZIOPar(n) { call =>
+      transact(call) @@ traces.span("execute datastore transaction")
+    }
 
   /** Execute each transaction in parallel in breaking the order downstream */
   def executeParUnordered[A](
       n: Int
-  ): ZPipeline[ZConnectionPool & PostgresConfig, Throwable, ZIO[ZConnection, Throwable, A], A] =
-    ZPipeline.serviceWithPipeline[PostgresConfig](config =>
-      ZPipeline[ZIO[ZConnection, Throwable, A]].mapZIOParUnordered(n) { call =>
-        transaction(call) @@ traces.span("execute datastore transaction")
-      }
-    )
+  ): ZPipeline[ZConnectionPool, Throwable, ZIO[ZConnection, Throwable, A], A] =
+    ZPipeline[ZIO[ZConnection, Throwable, A]].mapZIOParUnordered(n) { call =>
+      transact(call) @@ traces.span("execute datastore transaction")
+    }
 
   /** Execute all SQL statements in one large transaction */
   // NB: Don't try to parallelize this because postgres uses one thread per connection and since this is one large
@@ -42,7 +48,10 @@ package object backend:
   val executeInSingleTransaction: ZSink[ZConnectionPool, Throwable, ZIO[ZConnection, Throwable, Any], Nothing, Unit] =
     ZSink.unwrapScoped(
       transaction.build.map(connection =>
-        ZSink.foreach(identity[ZIO[ZConnection, Throwable, Any]]).provideEnvironment(connection)
+        ZSink
+          .foreach(identity[ZIO[ZConnection, Throwable, Any]])
+          .mapZIO(_ => commitTransaction)
+          .provideEnvironment(connection)
       )
     )
 

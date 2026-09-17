@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package com.digitalasset.pqs.schema.postgres.relational
 
 import com.digitalasset.pqs.SharedLedgerAndPostgresTest
@@ -17,16 +20,19 @@ object RelationalProjectionWriterSpec extends SharedLedgerAndPostgresTest:
                 |
                 |import Daml.Script
                 |
+                |data State = A | B | C deriving (Eq, Show)
+                |
                 |template Note
                 |  with
                 |    owner : Party
                 |    noteBody : Text
+                |    status : State
                 |  where
                 |    signatory owner
                 |
                 |setup : Party -> Script ()
                 |setup owner = do
-                |  _ <- submit owner $ createCmd Note with owner, noteBody = "hello"
+                |  _ <- submit owner $ createCmd Note with owner, noteBody = "hello", status = C
                 |  pure ()
                 |""".stripMargin
   )
@@ -62,10 +68,28 @@ object RelationalProjectionWriterSpec extends SharedLedgerAndPostgresTest:
           for
             _                   <- sql"set search_path to pqs_relational".execute
             (pkg, module, name) <- RelationalQueries.lineageOf("Note")
-            config = Map("asset" -> ProjectionDefinition(Seq(s"$pkg:$module:$name"), Seq("owner", "noteBody")))
+            config = Map(
+              "asset" -> ProjectionDefinition(Seq(s"$pkg:$module:$name"), Seq("owner", "noteBody", "status"))
+            )
+            enumId = Identifier(
+              PackageId("old"),
+              PackageName(pkg),
+              PackageVersion("1.0.0"),
+              ModuleName(module),
+              EntityName("State")
+            )
             _ <- ProjectionApply.apply(
               config,
-              schemaFor(pkg, module, name, Seq("owner" -> Descriptor.party, "noteBody" -> Descriptor.text))
+              schemaFor(
+                pkg,
+                module,
+                name,
+                Seq(
+                  "owner"    -> Descriptor.party,
+                  "noteBody" -> Descriptor.text,
+                  "status"   -> Descriptor.constructor(enumId, Descriptor.enumeration(Seq("A", "B")))
+                )
+              )
             )
             _ <-
               sql"update __query_projection set status = 'active', activated_at = now() where projection_version = 1".update
@@ -80,16 +104,18 @@ object RelationalProjectionWriterSpec extends SharedLedgerAndPostgresTest:
           for
             _    <- sql"set search_path to pqs_relational".execute
             base <- RelationalQueries.baseTableOf("Note")
-            rows <- SqlFragment(s"""select owner, "noteBody" from ${base} order by contract_pk""")
-              .query[(Option[String], Option[String])]
+            rows <- SqlFragment(s"""select owner, "noteBody", status from ${base} order by contract_pk""")
+              .query[(Option[String], Option[String], Option[String])]
               .selectAll
           yield rows match
-            case Seq((preOwner, preNote), (postOwner, postNote)) =>
+            case Seq((preOwner, preNote, preStatus), (postOwner, postNote, postStatus)) =>
               assertTrue(
                 preOwner.isEmpty,
                 preNote.isEmpty,
+                preStatus.isEmpty,
                 postOwner.exists(_.startsWith("Alice")),
-                postNote.contains("hello")
+                postNote.contains("hello"),
+                postStatus.contains("C")
               )
             case _ => assertTrue(false)
         )

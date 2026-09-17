@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package com.digitalasset.pqs.postgres.relational.projection
 
 import com.digitalasset.pqs.postgres.backend.encoding.ValueConverter
@@ -123,6 +126,19 @@ object TypedRowCodecSpec extends ZIOSpecDefault:
         TypedRowCodec.extract(shape, short)(6) == SqlValue.Null,
         TypedRowCodec.extract(shape, short)(3) == SqlValue.Text("Active")
       )
+    ,
+    test("an unknown enum ordinal fails explicitly instead of silently storing SQL NULL"):
+      val record = DynamicValue.Record(
+        DynamicValue.Party("Carol"),
+        DynamicValue.Numeric("1.00"),
+        DynamicValue.Bool(true),
+        DynamicValue.Enumeration(2),
+        DynamicValue.Timestamp(0L),
+        DynamicValue.Date(0),
+        DynamicValue.Optional(None)
+      )
+      val result = scala.util.Try(TypedRowCodec.extract(shape, record))
+      assertTrue(result.failed.toOption.exists(_.getMessage.contains("unknown enum ordinal 2")))
     ,
     test("encodes SqlValues to COPY tokens with the null sentinel and escaped text"):
       val conv = summon[ValueConverter[SqlValue]]

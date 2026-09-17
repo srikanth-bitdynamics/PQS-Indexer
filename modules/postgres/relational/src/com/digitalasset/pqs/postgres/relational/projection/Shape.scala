@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package com.digitalasset.pqs.postgres.relational.projection
 
 import com.digitalasset.transcode.schema.*
@@ -30,7 +33,8 @@ object Shape:
       pgType: PgType,
       nullable: Boolean,
       position: Int,
-      enumCases: Option[Seq[String]]
+      enumCases: Option[Seq[String]],
+      damlType: Option[String] = None
   )
 
   final case class ResolvedShape(
@@ -73,10 +77,16 @@ object Shape:
       case e: Descriptor.Enumeration             => Some((PgType.Text, Some(e.cases.map(_.toString))))
       case _                                     => None
 
-  private def classify(d: Descriptor): Option[(PgType, Boolean, Option[Seq[String]])] =
+  private def semanticType(d: Descriptor): String = d match
+    case Descriptor.Party                                              => "party"
+    case _: Descriptor.ContractId                                      => "contract-id"
+    case Descriptor.Enumeration.Ctor(_, _) | _: Descriptor.Enumeration => "enum"
+    case _ => primitive(d).map(_._1.sql).getOrElse("structural")
+
+  private def classify(d: Descriptor): Option[(PgType, Boolean, Option[Seq[String]], String)] =
     d match
-      case o: Descriptor.Optional => primitive(o.value).map((pg, ec) => (pg, true, ec))
-      case other                  => primitive(other).map((pg, ec) => (pg, false, ec))
+      case o: Descriptor.Optional => primitive(o.value).map((pg, ec) => (pg, true, ec, semanticType(o.value)))
+      case other                  => primitive(other).map((pg, ec) => (pg, false, ec, semanticType(other)))
 
   private def unionEnumCases(sets: Seq[Seq[String]]): Option[Option[Seq[String]]] =
     sets.maxByOption(_.size) match
@@ -92,7 +102,7 @@ object Shape:
       val present    = perVersion.filter(_.size > i).map(_(i))
       val namesOk    = present.map(_._1).distinct.size <= 1
       val classified = present.map((_, d) => classify(d))
-      val typeShapes = classified.map(_.map((pg, nullable, _) => (pg, nullable))).distinct
+      val typeShapes = classified.map(_.map((pg, nullable, _, semantic) => (pg, nullable, semantic))).distinct
       val enumUnion  = unionEnumCases(classified.flatMap(_.flatMap(_._3)))
       val diverges =
         (
@@ -100,8 +110,9 @@ object Shape:
           Some(s"field '$name' at position $i diverges across versions of ${lineage.qualified}; kept in JSON")
         )
       (namesOk, typeShapes, enumUnion) match
-        case (true, Seq(Some((pg, nullable))), Some(enumCases)) =>
-          (Right(PromotedField(name, pg, nullable, i, enumCases)), None)
+        case (true, Seq(Some((pg, nullable, semantic))), Some(enumCases))
+            if nullable || present.size == perVersion.size =>
+          (Right(PromotedField(name, pg, nullable, i, enumCases, Some(semantic))), None)
         case (true, Seq(None), _) =>
           (Left(name), None)
         case _ =>

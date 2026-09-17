@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package com.digitalasset.pqs.postgres.relational.projection
 
 import com.digitalasset.pqs.postgres.backend.encoding.{ValueConverter, given}
@@ -42,7 +45,15 @@ object TypedRowCodec:
       case Shape.PgType.Date        => SqlValue.Date(LocalDate.ofEpochDay(dv.date.toLong))
       case Shape.PgType.Timestamptz => SqlValue.Timestamptz(microsToInstant(dv.timestamp))
       case Shape.PgType.Bool        => SqlValue.Bool(dv.bool)
-      case Shape.PgType.Text => f.enumCases.fold(SqlValue.Text(dv.text))(cases => SqlValue.Text(cases(dv.enumeration)))
+      case Shape.PgType.Text =>
+        f.enumCases.fold(SqlValue.Text(dv.text)) { cases =>
+          val idx = dv.enumeration
+          if idx >= 0 && idx < cases.length then SqlValue.Text(cases(idx))
+          else
+            throw new IllegalArgumentException(
+              s"unknown enum ordinal $idx for promoted field '${f.name}'; refresh the projection binding"
+            )
+        }
 
   private def microsToInstant(micros: Long): Instant =
     Instant.ofEpochSecond(micros / 1000000L, (micros % 1000000L) * 1000L)

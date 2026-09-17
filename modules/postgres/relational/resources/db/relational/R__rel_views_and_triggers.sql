@@ -1,3 +1,6 @@
+-- Copyright (c) 2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
 create or replace function __rel_current_writer() returns __rel_watermark.instance_id%type
 as $$ select instance_id from __rel_watermark limit 1 $$
 language sql;
@@ -39,10 +42,9 @@ begin
     from drained d
     where c.contract_id = d.contract_id and c.archived_tx_ix is null;
 
-    -- advance this writer's coverage so through_offset tracks committed progress, not the ledger end sampled at startup
     update __query_coverage
     set through_offset = new.ledger_offset
-    where instance_id = new.instance_id;
+    where instance_id = new.instance_id and completed_at is null;
 
     return new;
 end;
@@ -79,4 +81,5 @@ select c.contract_pk,
        c.creation_synchronizer_id
 from __rel_contracts c
 where c.life_ix @> latest_ix()
-  and not c.divulged_only;
+  and not c.divulged_only
+  and c.redaction_id is null;

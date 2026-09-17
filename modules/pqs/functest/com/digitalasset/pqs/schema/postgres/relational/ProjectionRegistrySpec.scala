@@ -1,7 +1,9 @@
+// Copyright (c) 2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package com.digitalasset.pqs.schema.postgres.relational
 
 import com.digitalasset.pqs.SharedLedgerAndPostgresTest
-import com.digitalasset.pqs.functest.matchers.*
 import com.digitalasset.pqs.postgres.relational.projection.{ProjectionDefinition, ProjectionRegistry}
 import com.digitalasset.pqs.services.daml.{DamlSdk, DamlSource, Party}
 import com.digitalasset.pqs.services.postgres.Postgres

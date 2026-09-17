@@ -1,8 +1,48 @@
+// Copyright (c) 2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package com.digitalasset.pqs.postgres.relational.projection
 
+import com.digitalasset.transcode.schema.*
 import zio.test.*
 
 object ProjectionBindingSpec extends ZIOSpecDefault:
+  private def schema(cases: Seq[String], version: String = "1.0.0"): Schema =
+    val id = Identifier(
+      PackageId(version),
+      PackageName("Finance"),
+      PackageVersion(version),
+      ModuleName("Main"),
+      EntityName("Asset")
+    )
+    Dictionary.make(
+      Template(
+        id,
+        Descriptor.constructor(
+          id,
+          Descriptor.record(
+            Seq(
+              "status" -> Descriptor.constructor(id, Descriptor.enumeration(cases))
+            )
+          )
+        ),
+        None,
+        false,
+        Seq.empty,
+        Seq.empty
+      )
+    )
+
+  private def saved = ProjectionBinding.parse(
+    ProjectionApply
+      .plan(
+        Map("asset" -> ProjectionDefinition(Seq("Finance:Main:Asset"), Seq("status"))),
+        schema(Seq("A", "B"))
+      )
+      .resolvedShape
+      .render()
+  )
+
   private val json =
     """{"asset":{"Finance:Main:Asset":[
          {"name":"owner","type":"text","nullable":false,"position":0},
@@ -14,6 +54,24 @@ object ProjectionBindingSpec extends ZIOSpecDefault:
        ]}}"""
 
   def spec = suite("projection binding")(
+    test("rebinds an activated enum to appended cases without losing existing values"):
+      val bound = ProjectionBinding.rebind(saved, schema(Seq("A", "B", "C"), "2.0.0"))("Finance:Main:Asset")
+      assertTrue(
+        bound.promoted.head.enumCases.contains(Seq("A", "B", "C")),
+        TypedRowCodec.extract(bound, DynamicValue.Record(DynamicValue.Enumeration(2))) == Seq(
+          TypedRowCodec.SqlValue.Text("C")
+        ),
+        TypedRowCodec.extract(bound, DynamicValue.Record(DynamicValue.Enumeration(1))) == Seq(
+          TypedRowCodec.SqlValue.Text("B")
+        )
+      )
+    ,
+    test("rejects reordered, removed, and renamed enum constructors before decoding"):
+      val results = Seq(Seq("B", "A"), Seq("A"), Seq("A", "Renamed")).map(cases =>
+        scala.util.Try(ProjectionBinding.rebind(saved, schema(cases, "2.0.0")))
+      )
+      assertTrue(results.forall(_.failed.toOption.exists(_.getMessage.contains("incompatible"))))
+    ,
     test("reconstructs the resolved shape from stored JSON with pg types and union field count"):
       val shape = ProjectionBinding.parse(json)("Finance:Main:Asset")
       assertTrue(

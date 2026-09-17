@@ -1,8 +1,12 @@
+// Copyright (c) 2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package com.digitalasset.pqs.postgres.relational.projection
 
 import com.digitalasset.transcode.Codec
 import com.digitalasset.transcode.codec.json.JsonCodec
 import com.digitalasset.transcode.schema.*
+import com.digitalasset.pqs.utils.safeequals.===
 import ujson.Value
 import zio.ZIO
 import zio.jdbc.*
@@ -16,8 +20,22 @@ object ProjectionBackfill:
       version: Long,
       chunkSize: Int = ChunkSize
   ): ZIO[ZConnection, Throwable, Long] =
+    withProjectionLock(runLocked(schema, shapes, version, chunkSize))
+
+  private def runLocked(
+      schema: Schema,
+      shapes: Map[String, Shape.ResolvedShape],
+      version: Long,
+      chunkSize: Int
+  ): ZIO[ZConnection, Throwable, Long] =
     for
-      encoding <- readEncoding
+      _   <- ZIO.fail(new IllegalArgumentException("backfill chunk size must be positive")).when(chunkSize <= 0)
+      row <- ProjectionRegistry.get(version)
+      _ <- ZIO
+        .fail(new IllegalArgumentException(s"cannot backfill projection $version: it is not a pending draft"))
+        .unless(row.exists(_.status === "draft"))
+      boundShapes <- ZIO.attempt(ProjectionBinding.rebind(shapes, schema))
+      encoding    <- readEncoding
       codec = DescriptorSchemaProcessor
         .assertProcess(
           schema,
@@ -29,7 +47,9 @@ object ProjectionBackfill:
         )
         .matchByPackageId
       through <- resolveThrough(version)
-      _ <- ZIO.foreachDiscard(shapes.values.toSeq)(shape => backfillLineage(codec, shape, through, version, chunkSize))
+      _ <- ZIO.foreachDiscard(boundShapes.values.toSeq)(shape =>
+        backfillLineage(codec, shape, through, version, chunkSize)
+      )
     yield through
 
   def runAndPublish(
@@ -38,9 +58,28 @@ object ProjectionBackfill:
       version: Long,
       chunkSize: Int = ChunkSize
   ): ZIO[ZConnection, Throwable, Long] =
-    run(schema, shapes, version, chunkSize).flatMap(through =>
-      ProjectionRegistry.setBackfilledThrough(version, through).as(through)
+    withProjectionLock(
+      runLocked(schema, shapes, version, chunkSize).flatMap(through =>
+        ProjectionRegistry.setBackfilledThrough(version, through).as(through)
+      )
     )
+
+  private def withProjectionLock[A](body: ZIO[ZConnection, Throwable, A]): ZIO[ZConnection, Throwable, A] =
+    ZIO.serviceWithZIO[ZConnection] { connection =>
+      // A session lock survives chunk commits and excludes projection changes until backfill finishes.
+      ZIO.acquireReleaseWith(
+        sql"select pg_try_advisory_lock(${ProjectionRegistry.projectionLockKey})"
+          .query[Boolean]
+          .selectOne
+          .filterOrFail(_.contains(true))(
+            new IllegalStateException("another projection operation is running; retry backfill")
+          )
+      ) { _ =>
+        (connection.access(c => if !c.getAutoCommit then c.rollback()) *>
+          sql"select pg_advisory_unlock(${ProjectionRegistry.projectionLockKey})".query[Boolean].selectOne *>
+          commit).onError(_ => connection.access(_.close()).ignoreLogged).orDie.unit
+      }(_ => body <* commit)
+    }
 
   private def readEncoding: ZIO[ZConnection, Throwable, (Boolean, Boolean, Boolean)] =
     sql"select numeric_as_string, int64_as_string, exclude_nulls from __rel_encoding limit 1"
@@ -67,20 +106,40 @@ object ProjectionBackfill:
     if shape.promoted.isEmpty then ZIO.unit
     else
       val qualified = shape.lineage.qualified
-      resolveBaseTable(shape.lineage).flatMap { tbl =>
-        initProgress(version, qualified, through) *>
+      resolveBaseTable(shape.lineage).flatMap { (entityPk, tbl) =>
+        ensurePackagesPresent(entityPk, through) *>
+          initProgress(version, qualified, through) *>
           progressCursor(version, qualified).flatMap {
             case None => ZIO.unit
             case Some((cursorTx, cursorPk)) =>
-              chunkLoop(codec, shape, tbl, through, version, qualified, cursorTx, cursorPk, chunkSize)
+              chunkLoop(codec, shape, entityPk, tbl, through, version, qualified, cursorTx, cursorPk, chunkSize)
           }
       }
 
-  private def resolveBaseTable(l: Shape.Lineage): ZIO[ZConnection, Throwable, String] =
-    sql"""select base_table from __rel_entity
+  private def ensurePackagesPresent(entityPk: Long, through: Long): ZIO[ZConnection, Throwable, Unit] =
+    sql"""select count(*) from __rel_contracts c
+          where c.template_entity_pk = $entityPk and c.created_tx_ix <= $through and c.redaction_id is null
+            and not exists (select 1 from __rel_package pkg where pkg.id = c.representative_package_id)"""
+      .query[Long]
+      .selectOne
+      .map(_.getOrElse(0L))
+      .flatMap(missing =>
+        ZIO
+          .when(missing > 0L)(
+            ZIO.fail(
+              new RuntimeException(
+                s"cannot backfill: $missing contract(s) reference a package id absent from __rel_package"
+              )
+            )
+          )
+          .unit
+      )
+
+  private def resolveBaseTable(l: Shape.Lineage): ZIO[ZConnection, Throwable, (Long, String)] =
+    sql"""select pk, base_table from __rel_entity
           where package_name = ${l.packageName} and module_name = ${l.moduleName}
             and entity_name = ${l.entityName} and kind = 'template'"""
-      .query[String]
+      .query[(Long, String)]
       .selectOne
       .flatMap {
         case Some(tbl) => ZIO.succeed(tbl)
@@ -107,6 +166,7 @@ object ProjectionBackfill:
   private def chunkLoop(
       codec: Dictionary[Codec[Value]],
       shape: Shape.ResolvedShape,
+      entityPk: Long,
       tbl: String,
       through: Long,
       version: Long,
@@ -115,17 +175,18 @@ object ProjectionBackfill:
       cursorPk: Long,
       chunkSize: Int
   ): ZIO[ZConnection, Throwable, Unit] =
-    selectChunk(tbl, through, cursorTx, cursorPk, chunkSize).flatMap { rows =>
+    selectChunk(entityPk, tbl, through, cursorTx, cursorPk, chunkSize).flatMap { rows =>
       rows.maxByOption(row => (row._1, row._2)) match
         case None => complete(version, qualified)
         case Some(last) =>
           ZIO.foreachDiscard(rows)(row => backfillRow(codec, shape, tbl, row)) *>
             advanceCursor(version, qualified, last._1, last._2) *>
             commit *>
-            chunkLoop(codec, shape, tbl, through, version, qualified, last._1, last._2, chunkSize)
+            chunkLoop(codec, shape, entityPk, tbl, through, version, qualified, last._1, last._2, chunkSize)
     }
 
   private def selectChunk(
+      entityPk: Long,
       tbl: String,
       through: Long,
       cursorTx: Long,
@@ -137,9 +198,10 @@ object ProjectionBackfill:
           from ${tbl} p
           join __rel_contracts c on c.contract_pk = p.contract_pk
           join __rel_package pkg on pkg.id = c.representative_package_id
-          where c.redaction_id is null and c.created_tx_ix <= """
-    ) ++ sql"$through" ++ SqlFragment(" and (c.created_tx_ix, p.contract_pk) > (") ++ sql"$cursorTx" ++
-      SqlFragment(", ") ++ sql"$cursorPk" ++ SqlFragment(") order by c.created_tx_ix, p.contract_pk limit ") ++
+          where c.redaction_id is null and c.template_entity_pk = """
+    ) ++ sql"$entityPk" ++ SqlFragment(" and c.created_tx_ix <= ") ++ sql"$through" ++
+      SqlFragment(" and (c.created_tx_ix, c.contract_pk) > (") ++ sql"$cursorTx" ++
+      SqlFragment(", ") ++ sql"$cursorPk" ++ SqlFragment(") order by c.created_tx_ix, c.contract_pk limit ") ++
       sql"$chunkSize")
       .query[(Long, Long, String, String, String, String)]
       .selectAll
@@ -174,13 +236,17 @@ object ProjectionBackfill:
       ModuleName(shape.lineage.moduleName),
       EntityName(shape.lineage.entityName)
     )
-    val dv     = codec.template(id).toDynamicValue(ujson.read(json))
-    val values = shape.promoted.map(_.name).zip(TypedRowCodec.extract(shape, dv))
-    val assigns =
-      values.map((name, value) => SqlFragment(quoteIdent(name)) ++ sql" = " ++ bind(value)).mkFragment(sql", ")
-    (SqlFragment(s"update ${tbl} p set ") ++ assigns ++
-      SqlFragment(" from __rel_contracts c where p.contract_pk = ") ++ sql"$contractPk" ++
-      SqlFragment(" and c.contract_pk = p.contract_pk and c.redaction_id is null")).update.unit
+    ZIO
+      .attempt {
+        val dv     = codec.template(id).toDynamicValue(ujson.read(json))
+        val values = shape.promoted.map(_.name).zip(TypedRowCodec.extract(shape, dv))
+        val assigns =
+          values.map((name, value) => SqlFragment(quoteIdent(name)) ++ sql" = " ++ bind(value)).mkFragment(sql", ")
+        SqlFragment(s"update ${tbl} p set ") ++ assigns ++
+          SqlFragment(" from __rel_contracts c where p.contract_pk = ") ++ sql"$contractPk" ++
+          SqlFragment(" and c.contract_pk = p.contract_pk and c.redaction_id is null")
+      }
+      .flatMap(_.update.unit)
 
   private def bind(value: TypedRowCodec.SqlValue): SqlFragment =
     value match

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package com.digitalasset.pqs.postgres.backend
 
 import com.digitalasset.canonical.{ContractId, Party}
@@ -128,12 +131,13 @@ object copy:
     ): ZIO[ZConnection, Throwable, Chunk[Watermark]] =
       val copies                      = mutable.LinkedHashMap.empty[String, mutable.ListBuffer[String]]
       val watermarks                  = ChunkBuilder.make[Watermark]()
-      val txs                         = all.onlyTransactions()
+      val txs                         = all.onlyTransactions().toVector
+      val txsByIx                     = txs.iterator.map(tx => tx.ix -> tx).toMap
       val batchContents               = all.onlyCopies().groupMapReduce(_._table)(_ => 1L)(_ + _)
       def statAttribute(t: CopyTable) = s"pqs.${t.name}.rows_count" -> batchContents.getOrElse(t, 0L)
       all.foreach {
         case c: Copy      => copies.getOrElseUpdate(c._sql, mutable.ListBuffer.empty).addOne(c._row)
-        case w: Watermark => watermarks.addOne(w.copy(txSpans = txs.find(_.ix == w.ix).flatMap(_.span).toList))
+        case w: Watermark => watermarks.addOne(w.copy(txSpans = txsByIx.get(w.ix).flatMap(_.span).toList))
       }
 
       val forcedCopies = copies.view

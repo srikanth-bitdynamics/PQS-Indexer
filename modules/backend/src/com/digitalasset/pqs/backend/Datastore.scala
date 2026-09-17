@@ -45,9 +45,6 @@ trait Datastore:
   def processTransactions
       : ProcessingSink[(Transaction[Event | TreeEvent | ReassignmentEvent], Datastore.TransactionIndex)]
 
-  /** Capabilities this datastore opts into. The defaults describe the document backend. */
-  def capabilities: Datastore.Capabilities = Datastore.Capabilities()
-
   /** Record the ingestion coverage the pipeline resolved for this run. Datastores that do not track coverage ignore it.
     */
   def recordCoverage(record: Datastore.CoverageRecord): Task[Unit] = ZIO.unit
@@ -57,8 +54,6 @@ object Datastore:
   type TransactionIndex  = Long
   type Checkpoint        = (Offset, TransactionIndex)
   type ProcessingSink[A] = ZSink[Any, Throwable, A, Nothing, Unit]
-
-  final case class Capabilities(reassignments: Boolean = false, coverage: Boolean = false)
 
   enum Datasource:
     case TransactionStream, TransactionTreeStream

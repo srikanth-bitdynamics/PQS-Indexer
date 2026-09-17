@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package com.digitalasset.pqs.postgres.relational
 
 import com.digitalasset.canonical
@@ -8,6 +11,7 @@ import com.digitalasset.pqs.o11y.metrics.latency
 import com.digitalasset.pqs.o11y.traces
 import com.digitalasset.pqs.o11y.traces.given
 import com.digitalasset.pqs.postgres.backend.*
+import com.digitalasset.pqs.postgres.backend.{transact as transaction}
 import com.digitalasset.pqs.postgres.relational.projection.{ProjectionBinding, Shape, TypedRowCodec}
 import com.digitalasset.transcode.Codec
 import com.digitalasset.transcode.schema.{ChoiceName, Dictionary, DynamicValue, Identifier}
@@ -17,6 +21,7 @@ import zio.jdbc.*
 import zio.metrics.Metric
 import zio.metrics.MetricKeyType.Histogram.Boundaries
 import zio.stream.{ZChannel, ZPipeline, ZSink}
+import com.digitalasset.zio.daml.DamlSchema
 import zio.{Chunk, ChunkBuilder, Schedule, ZEnvironment, ZIO, ZLayer, durationInt}
 
 import scala.collection.mutable
@@ -26,7 +31,6 @@ final case class RelationalPostgres(
     config: SchemaConfig,
     poolConfig: PostgresConfig,
     pool: ZConnectionPool,
-    schema: RelSqlSchema,
     codec: Dictionary[Codec[Value]],
     getEntityPk: Identifier => specific.EntityTypePk,
     getExercisePk: (Identifier, ChoiceName) => specific.EntityTypePk,
@@ -34,7 +38,8 @@ final case class RelationalPostgres(
     getViewTable: Identifier => String,
     isTemplate: Identifier => Boolean,
     placeholders: IdPlaceholder.Factory,
-    projectionShapes: Map[String, Shape.ResolvedShape]
+    projectionShapes: Map[String, Shape.ResolvedShape],
+    fenceIdentity: WriterFence.Identity
 ) extends Datastore:
   import com.digitalasset.pqs.postgres.relational.model.{offsetEncoder, toSqlValue}
 
@@ -45,16 +50,12 @@ final case class RelationalPostgres(
 
   private val Genesis: Datastore.Checkpoint = (Offset.Genesis, 0L)
   private val env                           = ZEnvironment(pool) ++ ZEnvironment(config) ++ ZEnvironment(poolConfig)
-  private val tx                            = ZLayer.succeedEnvironment(env) >>> transaction
-  private val BatchEntitiesThreshold        = 10_000
-  private val BatchReleaseWindow            = 200.millis
-  private val ReservedConnections           = 1
-  private val IngestParallelism             = math.max(1, poolConfig.maxConnections - ReservedConnections)
-
-  private val commitBatch: ZIO[ZConnection, Throwable, Unit] =
-    ZIO.serviceWithZIO[ZConnection](_.access(c => if !c.getAutoCommit then c.commit()))
-
-  override def capabilities = Datastore.Capabilities(reassignments = false, coverage = true)
+  private def tx[A](effect: ZIO[ZConnection, Throwable, A]): ZIO[Any, Throwable, A] =
+    transaction(WriterFence.check(fenceIdentity) *> effect).provideEnvironment(env)
+  private val BatchEntitiesThreshold = 10_000
+  private val BatchReleaseWindow     = 200.millis
+  private val ReservedConnections    = 1
+  private val IngestParallelism      = math.max(1, poolConfig.maxConnections - ReservedConnections)
 
   override def registerActiveWriterAndCleanupTransactions = tx(
     sql"call __rel_cleanup_transactions_after_watermark()".execute
@@ -76,7 +77,8 @@ final case class RelationalPostgres(
       case Datastore.Datasource.TransactionTreeStream => true
       case Datastore.Datasource.TransactionStream     => false
     tx(
-      sql"call __rel_ensure_writer_valid()".execute *>
+      sql"""update __query_coverage set completed_at = now()
+              where instance_id = current_setting('scribe.instance') and completed_at is null""".update *>
         sql"""insert into __query_coverage (
                 instance_id, source_kind, requested_from_offset, actual_from_offset, through_offset, source_pruned_offset,
                 acs_seed_offset, ingested_all_parties, ingested_parties, contract_filter, metadata_filter, tree_stream,
@@ -199,8 +201,7 @@ final case class RelationalPostgres(
         val onlyTxs = models.onlyTransactions()
         ZIO.attempt {
           traces.span("execute batch") {
-            (sql"call __rel_ensure_writer_valid()".execute *> model.Model.prepareStatement(models, model.statTables)
-              <* commitBatch)
+            (WriterFence.check(fenceIdentity) *> model.Model.prepareStatement(models, model.statTables))
               @@ trackExecute
               @@ traces.attributes("pqs.batch.models_count" -> models.length.toLong)
               <* ZIO.foreachDiscard(onlyTxs) { tx =>
@@ -462,11 +463,13 @@ object RelationalPostgres:
         poolConfig <- ZIO.service[PostgresConfig]
         instanceId <- ZIO.service[InstanceId]
         pool       <- ZIO.service[ZConnectionPool]
-        schema     <- ZIO.service[RelSqlSchema]
         codec      <- ZIO.service[Dictionary[Codec[Value]]]
+        schema     <- ZIO.serviceWith[DamlSchema](_.schema)
         encoding   <- ZIO.service[EncodingConfig]
 
-        fenceEnv <- WriterFence.acquire(pool, poolConfig.maxConnections)
+        fenceEnv      <- WriterFence.acquire(pool, poolConfig.maxConnections)
+        fenceIdentity <- WriterFence.identity.provideEnvironment(fenceEnv)
+        _             <- fenceEnv.get[ZConnection].access(_.commit())
 
         _ <- RelationalSchema.applySchema(poolConfig, instanceId, config.baseline) when config.autoApply
         _ <- transaction(
@@ -519,14 +522,14 @@ object RelationalPostgres:
         }
         placeholders = IdPlaceholder.factory(lastId)
 
-        projectionShapes <- ProjectionBinding.activeShapes.provideEnvironment(fenceEnv)
+        savedShapes      <- ProjectionBinding.activeShapes.provideEnvironment(fenceEnv)
+        projectionShapes <- ZIO.attempt(ProjectionBinding.rebind(savedShapes, schema))
         _                <- fenceEnv.get[ZConnection].access(_.commit())
         _                <- logInfo(s"Bound ${projectionShapes.size} active projection shape(s)")
       yield RelationalPostgres(
         config,
         poolConfig,
         pool,
-        schema,
         codec,
         getEntityPk,
         getExercisePk,
@@ -534,7 +537,8 @@ object RelationalPostgres:
         getViewTable,
         isTemplate,
         placeholders,
-        projectionShapes
+        projectionShapes,
+        fenceIdentity
       )
     }
   }

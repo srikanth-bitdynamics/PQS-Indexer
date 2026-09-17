@@ -17,7 +17,6 @@ object postgres {
   val jdbcUpGauge = zio.metrics.Metric.gauge("jdbc_conn_pool_up", "JDBC connection pool is up")
 
   private val connectionIsValidLatency = latency("jdbc_conn_isvalid", "Latency of database connection validation")
-  private val connectionCommitLatency  = latency("jdbc_conn_commit", "Latency of database connection commit")
   private val connectionUsageLatency =
     zio.metrics.Metric
       .histogram(
@@ -29,7 +28,14 @@ object postgres {
   private val trackSuccess = connectionUsageLatency.tagged("result", "success")
   private val trackFailure = connectionUsageLatency.tagged("result", "failure")
 
-  class PGRestorableConnection(val underlying: Connection) extends ZConnection.Restorable(underlying: Connection)
+  class PGRestorableConnection(val underlying: Connection) extends ZConnection.Restorable(underlying: Connection) {
+    val discarded = new java.util.concurrent.atomic.AtomicBoolean(false)
+  }
+
+  private def discardState(connection: Connection): java.util.concurrent.atomic.AtomicBoolean = connection match {
+    case pg: PGRestorableConnection => pg.discarded
+    case _                          => throw new IllegalStateException("Unexpected PostgreSQL connection wrapper")
+  }
 
   def connectionPool(
       props: Map[String, String]
@@ -39,66 +45,73 @@ object postgres {
     acquire = ZIO.attemptBlocking {
       val properties = new java.util.Properties
       props.foreachEntry((k, v) => properties.put(k, v))
-      val con = java.sql.DriverManager
+      java.sql.DriverManager
         .getConnection(s"jdbc:postgresql://${config.host}:${config.port}/${config.database}", properties)
-      con.setAutoCommit(false)
-      con
     }
-    getConn = ZIO.acquireRelease( // acquire
-      acquire.retry(Schedule.stop).flatMap(con => ZIO.attempt(ZConnection(PGRestorableConnection(con))))
-    )( // release
-      _.close.ignoreLogged
-    )
+    getConn = ZIO.acquireRelease(acquire)(con => ZIO.attemptBlocking(con.close()).ignoreLogged).flatMap { con =>
+      ZIO.attemptBlocking {
+        con.setAutoCommit(false)
+        val connection = ZConnection(PGRestorableConnection(con))
+        con.commit()
+        connection
+      }
+    }
     pool <- ZPool.make(getConn, Range(config.maxConnections, config.maxConnections), zio.Duration.Infinity)
+    discard = (connection: ZConnection) =>
+      connection.access(c => discardState(c).set(true)).orDie *> pool.invalidate(connection)
     tx = ZLayer.scoped {
       traces.span("acquire connection") {
         for
           start      <- zio.Clock.nanoTime
           connection <- pool.get
           _ <- ZIO.addFinalizerExit { exit =>
-            ZIO.ifZIO((connection.isValid() @@ connectionIsValidLatency).orElseSucceed(false))(
-              onTrue = exit match {
-                case Exit.Success(_) =>
-                  for
-                    autoCommitMode <- connection.access(_.getAutoCommit).orElseSucceed(true)
-                    _ <- ZIO.unless(autoCommitMode) {
-                      (connection.access(_.commit())
-                        @@ connectionCommitLatency
-                        @@ traces.span("commit transaction")).ignoreLogged
-                    }
-                    _   <- connection.restore
-                    end <- zio.Clock.nanoTime
-                    _   <- trackSuccess.update(end - start)
-                  yield ()
-                case Exit.Failure(_) =>
-                  for
-                    autoCommitMode <- connection.access(_.getAutoCommit).orElseSucceed(true)
-                    _              <- ZIO.unless(autoCommitMode)(connection.rollback.ignoreLogged)
-                    _              <- connection.restore
-                    end            <- zio.Clock.nanoTime
-                    _              <- trackFailure.update(end - start)
-                  yield ()
-              },
-              onFalse = pool.invalidate(connection)
-            )
+            connection.access(c => discardState(c).get()).orDie.flatMap { discarded =>
+              if discarded then zio.Clock.nanoTime.flatMap(end => trackFailure.update(end - start))
+              else
+                exit match {
+                  case Exit.Success(_) =>
+                    for
+                      _ <- connection
+                        .access(c => if !c.getAutoCommit then c.commit())
+                        .onError(_ => discard(connection))
+                        .orDie
+                      _   <- connection.restore
+                      end <- zio.Clock.nanoTime
+                      _   <- trackSuccess.update(end - start)
+                    yield ()
+                  case Exit.Failure(_) =>
+                    for
+                      _ <- connection
+                        .access(c => if !c.getAutoCommit then c.rollback())
+                        .foldZIO(
+                          _ => discard(connection),
+                          _ => connection.restore
+                        )
+                      end <- zio.Clock.nanoTime
+                      _   <- trackFailure.update(end - start)
+                    yield ()
+                }
+            }
           }
         yield connection
       }
     }
-    _ <- tx(sql"""select 1""".query[Int].selectOne).someOrFail(Throwable("Connection not ready"))
+    probe = tx(
+      ZIO
+        .serviceWithZIO[ZConnection](_.isValid() @@ connectionIsValidLatency)
+        .filterOrFail(identity)(new java.sql.SQLException("Connection not ready"))
+    )
+    _ <- probe
     _ <- ZIO.acquireRelease(jdbcUpGauge.set(1))(_ => jdbcUpGauge.set(0))
 
     // periodic database connectivity probe
     _ <- ZIO.when(!config.probeInterval.isZero) {
-      val probe = tx(sql"""select 1""".query[Int].selectOne)
-
       // After a probe failure, drain remaining stale connections from the pool.
       // We iterate maxConnections times, acquiring and testing one connection per iteration.
       // The pool uses a FIFO queue, so under no contention this visits each connection exactly
       // once. Under contention (other fibers also borrowing connections), we may probe some
-      // connections more than once — but that is fine: those other fibers are also revalidating
-      // their connections, so iterating n times still guarantees every connection is touched at
-      // least once. Acquisition failures are handled gracefully (database might be down).
+      // connections more than once. Borrowers also invalidate connections when rollback fails.
+      // Acquisition failures are handled gracefully (database might be down).
       // Individual connection testing failures don't stop the overall drain operation.
       // This piece is crucial to prevent the pool from repeatedly handing out stale
       // connections after a database outage while there is no ledger data in flight.
@@ -111,10 +124,11 @@ object postgres {
                   .query[Int]
                   .selectOne
                   .provide(ZLayer.succeed(conn))
+                  .flatMap(_ => conn.rollback)
                   .foldCauseZIO(
                     cause =>
                       ZIO.logWarning(s"Connection test query failed: ${cause.squash.getMessage}") *>
-                        pool.invalidate(conn),
+                        discard(conn),
                     _ => ZIO.logDebug("Connection test query succeeded")
                   )
               }
@@ -128,18 +142,18 @@ object postgres {
           cause =>
             jdbcUpGauge.set(0) *>
               ZIO.logWarning(
-                s"Database probe (select 1) failed: ${cause.squash.getMessage}; draining stale connections"
+                s"Database probe failed: ${cause.squash.getMessage}; draining stale connections"
               ) *>
               drainStaleConnections,
           _ =>
             jdbcUpGauge.set(1) *>
-              ZIO.logInfo("Database probe (select 1) successful")
+              ZIO.logInfo("Database probe successful")
         )
         .repeat(Schedule.spaced(config.probeInterval))
         .forkScoped
     }
   yield new ZConnectionPool {
     def transaction: ZLayer[Any, Throwable, ZConnection] = tx
-    def invalidate(conn: ZConnection): UIO[Any]          = pool.invalidate(conn)
+    def invalidate(conn: ZConnection): UIO[Any]          = discard(conn)
   })
 }

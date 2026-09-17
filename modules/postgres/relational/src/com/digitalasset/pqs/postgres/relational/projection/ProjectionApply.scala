@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package com.digitalasset.pqs.postgres.relational.projection
 
 import com.digitalasset.transcode.schema.Schema
@@ -104,6 +107,7 @@ object ProjectionApply:
       "position" -> f.position
     )
     f.enumCases.foreach(cases => base("enum") = ujson.Arr(cases.map(ujson.Str(_))*))
+    f.damlType.foreach(t => base("daml_type") = ujson.Str(t))
     base
 
   private def shapeJson(

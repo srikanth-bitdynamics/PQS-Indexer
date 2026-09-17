@@ -1,10 +1,13 @@
+// Copyright (c) 2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package com.digitalasset.pqs.postgres.relational.projection
 
+import com.digitalasset.pqs.utils.safeequals.===
+import com.digitalasset.pqs.postgres.backend.{transact as transaction}
 import ujson.Value
 import zio.ZIO
 import zio.jdbc.*
-
-import java.security.MessageDigest
 
 object IndexManager:
   import IndexPlanner.OrderKey
@@ -31,10 +34,14 @@ object IndexManager:
   ):
     def columns: Seq[String] = keys.map(_.column)
 
-    def definition: String =
+    def definition: String = definitionOn(quoteIdent(table))
+
+    def definitionIn(schema: String): String = definitionOn(s"${quoteIdent(schema)}.${quoteIdent(table)}")
+
+    private def definitionOn(target: String): String =
       val cols = keys.map(k => quoteIdent(k.column) + (if k.ascending then "" else " desc")).mkString(", ")
       val incl = include.map(quoteIdent).mkString(", ")
-      s"create index concurrently if not exists ${quoteIdent(name)} on ${quoteIdent(table)} ($cols) include ($incl)"
+      s"create index concurrently if not exists ${quoteIdent(name)} on $target ($cols) include ($incl)"
 
   final case class Plan(indexes: Seq[PlannedIndex], diagnostics: Seq[String], notes: Seq[String])
 
@@ -57,7 +64,12 @@ object IndexManager:
       planProjection(name, definition, shapes.getOrElse(name, Map.empty), baseTables)
     }
     Plan(
-      perName.flatMap(_._1),
+      perName
+        .flatMap(_._1)
+        .groupMapReduce(i => (i.table, i.name))(identity)((a, b) => a.copy(covered = (a.covered ++ b.covered).distinct))
+        .values
+        .toSeq
+        .sortBy(i => (i.table, i.name)),
       perName.flatMap(_._2).distinct.sorted,
       perName.flatMap(_._3).distinct.sorted
     )
@@ -99,7 +111,7 @@ object IndexManager:
     val specs       = IndexPlanner.plan(payloadReqs, promoted).indexes
     val attributed  = indexable.map(c => (c, specs.filter(covers(_, c)).maxByOption(_.columns.length)))
     val indexes = specs.flatMap { spec =>
-      attributed.collect { case (c, Some(s)) if specEq(s, spec) => c } match
+      attributed.collect { case (c, Some(s)) if s === spec => c } match
         case Seq() => Seq.empty[PlannedIndex]
         case forSpec =>
           val keys = spec.equality.map(OrderKey(_, true)) ++ spec.ordered
@@ -138,26 +150,8 @@ object IndexManager:
     )
 
   private def covers(spec: IndexPlanner.IndexSpec, c: Classified): Boolean =
-    val equalitySet = spec.equality.toSet
-    c.payloadFilter.forall(equalitySet.contains) && isPrefix(c.payloadOrder, spec.ordered)
-
-  private def isPrefix(xs: Seq[OrderKey], ys: Seq[OrderKey]): Boolean =
-    xs.length <= ys.length && xs.corresponds(ys.take(xs.length))(sameKey)
-
-  private def specEq(a: IndexPlanner.IndexSpec, b: IndexPlanner.IndexSpec): Boolean =
-    a.equality.corresponds(b.equality)(strEq) && a.ordered.corresponds(b.ordered)(sameKey)
-
-  private def sameKey(a: OrderKey, b: OrderKey): Boolean =
-    strEq(a.column, b.column) && ((a.ascending, b.ascending) match
-      case (true, true)   => true
-      case (false, false) => true
-      case _              => false
-    )
-
-  private def strEq(a: String, b: String): Boolean =
-    a.compareTo(b) match
-      case 0 => true
-      case _ => false
+    val ordered = c.payloadOrder.filterNot(k => c.payloadFilter.contains(k.column)).distinctBy(_.column)
+    (spec.equality.toSet === c.payloadFilter.toSet) && spec.ordered.startsWith(ordered)
 
   private def tokenOf(k: OrderKey): String = if k.ascending then k.column else s"${k.column} desc"
 
@@ -168,14 +162,11 @@ object IndexManager:
 
   private def indexName(table: String, keys: Seq[OrderKey]): String =
     val tokens = keys.map(k => if k.ascending then k.column else s"${k.column}_desc")
-    val raw    = s"$table|${tokens.mkString(",")}"
+    val raw    = ujson.Arr(ujson.Str(table), ujson.Arr.from(keys.map(k => ujson.Arr(k.column, k.ascending))))
     val slug   = s"${table}_${tokens.mkString("_")}".toLowerCase.replaceAll("[^a-z0-9]", "_")
     val prefix = "rix_"
     val budget = 63 - prefix.length - 14
-    s"$prefix${slug.take(budget)}_h${md5(raw).take(12)}"
-
-  private def md5(s: String): String =
-    MessageDigest.getInstance("MD5").digest(s.getBytes("UTF-8")).map(b => f"${b & 0xff}%02x").mkString
+    s"$prefix${slug.take(budget)}_h${ProjectionDefinition.canonicalHash(raw).take(12)}"
 
   private def shapeJson(s: CoveredShape): Value =
     val requested = s.filter.map(f => ujson.Obj("column" -> f, "kind" -> "eq")) ++
@@ -204,6 +195,7 @@ object IndexManager:
     case Valid(name: String)
     case Invalid(name: String)
     case Missing(name: String)
+    case Mismatch(name: String)
 
   private final case class Active(
       version: Long,
@@ -212,49 +204,82 @@ object IndexManager:
   )
 
   def build: ZIO[ZConnectionPool, Throwable, String] =
-    transaction(planActive).flatMap {
+    withLifecycleLock(planActive.flatMap {
       case None => ZIO.succeed("No active projection; nothing to build")
       case Some((version, p)) =>
         for
-          _        <- transaction(ZIO.foreachDiscard(p.indexes)(insertBuilding(version, _)))
-          failures <- ZIO.foreach(p.indexes)(idx => runConcurrently(idx.definition).either.map(idx.name -> _))
-          outcomes <- transaction(ZIO.foreach(p.indexes)(validateOne))
-          invalid = outcomes.toSeq.collect { case Validation.Invalid(n) => n }
-          _    <- ZIO.foreachDiscard(invalid)(n => runConcurrently(dropDdl(n)).ignore)
-          _    <- transaction(ZIO.foreachDiscard(invalid)(markRetired))
-          rows <- transaction(listRows)
-        yield renderBuild(p, failures.toSeq, rows)
-    }
+          schema <- currentSchema
+          _      <- ZIO.foreachDiscard(p.indexes)(insertBuilding(version, _))
+          failures <- ZIO.foreach(p.indexes)(idx =>
+            (dropIfInvalid(schema, idx) *> runConcurrently(idx.definitionIn(schema))).either.map(idx.name -> _)
+          )
+          outcomes <- ZIO.foreach(p.indexes)(validateOne)
+          invalid = outcomes.toSeq.collect {
+            case Validation.Invalid(n)  => s"$n is not ready/valid; inspect the failed build before retrying"
+            case Validation.Missing(n)  => s"$n is missing from the configured schema"
+            case Validation.Mismatch(n) => s"$n does not match the registered table and planned definition"
+          }
+          errors = failures.collect { case (name, Left(error)) => s"$name: ${error.getMessage}" } ++ invalid
+          _ <- ZIO
+            .fail(new RuntimeException(errors.mkString("Index build failed: ", "; ", "")))
+            .when(errors.nonEmpty)
+        yield renderBuild(p)
+    })
 
   def adopt: ZIO[ZConnectionPool, Throwable, String] =
-    transaction(planActive).flatMap {
-      case None => ZIO.succeed("No active projection; nothing to adopt")
-      case Some((version, p)) =>
-        transaction(
-          for
-            adopted <- sql"""update __rel_managed_index set status = 'active'::rel_index_status, adopted = true
-                             where projection_version = $version and status = 'valid'::rel_index_status""".update
-            superseded <- supersede(p.indexes.map(_.name))
-          yield s"Adopted $adopted index(es); marked $superseded obsolete index(es) for retirement"
-        )
+    withLifecycleLock {
+      planActive.flatMap {
+        case None => ZIO.succeed("No active projection; nothing to adopt")
+        case Some((version, p)) =>
+          ZIO.foreach(p.indexes)(validateOne).flatMap { outcomes =>
+            val complete = p.indexes.nonEmpty && outcomes.forall {
+              case Validation.Valid(_) => true
+              case _                   => false
+            }
+            if !complete then
+              ZIO.succeed(
+                "Adopted 0 index(es); retirement deferred until all planned indexes are valid (existing coverage kept)"
+              )
+            else
+              for
+                adopted <- (sql"""update __rel_managed_index
+                                    set projection_version = $version, status = 'active'::rel_index_status, adopted = true
+                                    where status in ('valid'::rel_index_status, 'active'::rel_index_status)
+                                      and index_name = any(""" ++ textArray(p.indexes.map(_.name)) ++ sql")").update
+                superseded <- supersede(p.indexes.map(_.name))
+              yield s"Adopted $adopted index(es); marked $superseded obsolete index(es) for retirement"
+          }
+      }
     }
 
   def retire: ZIO[ZConnectionPool, Throwable, String] =
-    for
-      names <- transaction(
-        sql"select index_name from __rel_managed_index where status = 'retiring'::rel_index_status"
-          .query[String]
-          .selectAll
-          .map(_.toSeq)
-      )
-      _ <- ZIO.foreachDiscard(names)(n => runConcurrently(dropDdl(n)).ignore)
-      retired <- transaction(
-        (sql"""update __rel_managed_index set status = 'retired'::rel_index_status
+    withLifecycleLock {
+      for
+        schema <- currentSchema
+        active <- planActive
+        planned = active.toList.flatMap(_._2.indexes.map(_.name)).toSet
+        candidates <-
+          sql"select index_name, table_name, physical_oid::bigint from __rel_managed_index where status = 'retiring'::rel_index_status"
+            .query[(String, String, Option[Long])]
+            .selectAll
+            .map(_.toSeq)
+        results <- ZIO.foreach(candidates.filterNot(c => planned.contains(c._1))) { (name, table, oid) =>
+          (verifyOwnership(schema, name, table, oid) *> runConcurrently(dropDdl(schema, name))).either.map(name -> _)
+        }
+        dropped  = results.collect { case (n, Right(_)) => n }
+        failures = results.collect { case (name, Left(error)) => s"$name: ${error.getMessage}" }
+        retired <-
+          (sql"""update __rel_managed_index set status = 'retired'::rel_index_status
                where status = 'retiring'::rel_index_status and index_name = any(""" ++ textArray(
-          names
-        ) ++ sql")").update
-      )
-    yield s"Retired $retired index(es)"
+            dropped
+          ) ++ sql")").update
+      yield
+        if results.size > dropped.size then
+          s"Retired $retired index(es); ${failures.size} drop(s) failed and remain retiring for retry: ${failures.mkString("; ")}"
+        else if candidates.size > results.size then
+          s"Retired $retired index(es); kept ${candidates.size - results.size} index(es) required by the active projection"
+        else s"Retired $retired index(es)"
+    }
 
   def listReport: ZIO[ZConnectionPool, Throwable, String] =
     transaction(listRows).map { rows =>
@@ -303,7 +328,32 @@ object IndexManager:
 
   private def insertBuilding(version: Long, idx: PlannedIndex): ZIO[ZConnection, Throwable, Unit] =
     val shapes = textArray(idx.covered.map(s => ujson.write(shapeJson(s))))
-    (sql"""insert into __rel_managed_index
+    val ensureManaged = sql"""select exists (
+          select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace
+          where n.nspname = current_schema() and c.relname = ${idx.name}
+        ) and not exists (
+          select 1 from __rel_managed_index
+          where index_name = ${idx.name} and table_name = ${idx.table} and definition = ${idx.definition}
+            and status <> 'retired'::rel_index_status
+        )""".query[Boolean].selectOne.flatMap { collision =>
+      ZIO
+        .fail(new RuntimeException(s"Refusing unmanaged index name collision: ${idx.name}"))
+        .when(collision.contains(true))
+    }
+    // A re-planned retiring index must re-enter validation before it can be adopted again.
+    val refresh = (sql"""update __rel_managed_index m
+          set projection_version = $version, covered_query_shapes = """ ++ shapes ++ sql""",
+              physical_oid = case when p.present then m.physical_oid else null end,
+              status = case
+                when p.present and m.status = 'retiring'::rel_index_status then 'building'::rel_index_status
+                when p.present then m.status
+                else 'building'::rel_index_status end
+          from (select exists (
+            select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace
+            where n.nspname = current_schema() and c.relname = ${idx.name}) as present) p
+          where m.index_name = ${idx.name} and m.table_name = ${idx.table} and m.definition = ${idx.definition}
+            and m.status <> 'retired'::rel_index_status""").update
+    ensureManaged *> refresh *> (sql"""insert into __rel_managed_index
              (projection_version, table_name, index_name, definition, columns, opclasses,
               status, adopted, covered_query_shapes, created_at)
            select $version, ${idx.table}, ${idx.name}, ${idx.definition}, """ ++ textArray(idx.columns) ++
@@ -313,22 +363,48 @@ object IndexManager:
              where m.index_name = ${idx.name} and m.status <> 'retired'::rel_index_status)""").update.unit
 
   private def validateOne(idx: PlannedIndex): ZIO[ZConnection, Throwable, Validation] =
-    sql"""select i.indisvalid and i.indisready from pg_class c
-          join pg_index i on i.indexrelid = c.oid where c.relname = ${idx.name}"""
-      .query[Boolean]
+    val directions = idx.keys.map(k => if k.ascending then "0" else "3")
+    (sql"""select i.indisvalid and i.indisready,
+            t.relnamespace = c.relnamespace and t.relname = ${idx.table}
+            and am.amname = 'btree' and not i.indisunique and not i.indisprimary and not i.indisexclusion
+            and i.indpred is null and i.indexprs is null
+            and i.indnkeyatts = ${idx.keys.size} and i.indnatts = ${idx.keys.size + idx.include.size}
+            and array(select a.attname::text from unnest(i.indkey) with ordinality k(attnum, pos)
+                      join pg_attribute a on a.attrelid = t.oid and a.attnum = k.attnum
+                      order by k.pos) = """ ++ textArray(idx.columns ++ idx.include) ++
+      sql""" and array(select opt::text from unnest(i.indoption) opt) = """ ++ textArray(directions) ++
+      sql""" and not exists (
+              select 1 from unnest(i.indkey) with ordinality k(attnum, pos)
+              join pg_attribute a on a.attrelid = t.oid and a.attnum = k.attnum
+              join pg_opclass opc on opc.oid = i.indclass[k.pos::int - 1]
+              where k.pos <= i.indnkeyatts
+                and (not opc.opcdefault or i.indcollation[k.pos::int - 1] <> a.attcollation)
+            ) and exists (
+              select 1 from __rel_managed_index m where m.index_name = ${idx.name}
+                and m.table_name = ${idx.table} and m.definition = ${idx.definition}
+            and m.status in ('building'::rel_index_status, 'valid'::rel_index_status, 'active'::rel_index_status)
+            and (m.physical_oid is null or m.physical_oid = c.oid)
+            )
+          from pg_class c join pg_namespace n on n.oid = c.relnamespace
+          join pg_index i on i.indexrelid = c.oid join pg_class t on t.oid = i.indrelid
+          join pg_am am on am.oid = c.relam
+          where n.nspname = current_schema() and c.relname = ${idx.name}""")
+      .query[(Boolean, Boolean)]
       .selectOne
       .flatMap {
-        case Some(true) =>
-          sql"""update __rel_managed_index set status = 'valid'::rel_index_status, validated_at = now()
-                where index_name = ${idx.name} and status = 'building'::rel_index_status""".update
+        case Some((true, true)) =>
+          sql"""update __rel_managed_index
+                set status = case when status = 'active'::rel_index_status then status else 'valid'::rel_index_status end,
+                    validated_at = now(), physical_oid = (
+                      select c.oid from pg_class c join pg_namespace n on n.oid = c.relnamespace
+                      where n.nspname = current_schema() and c.relname = ${idx.name})
+                where index_name = ${idx.name}
+                  and status in ('building'::rel_index_status, 'valid'::rel_index_status, 'active'::rel_index_status)""".update
             .as(Validation.Valid(idx.name))
-        case Some(false) => ZIO.succeed(Validation.Invalid(idx.name))
-        case None        => ZIO.succeed(Validation.Missing(idx.name))
+        case Some((_, false)) => ZIO.succeed(Validation.Mismatch(idx.name))
+        case Some((false, _)) => ZIO.succeed(Validation.Invalid(idx.name))
+        case None             => ZIO.succeed(Validation.Missing(idx.name))
       }
-
-  private def markRetired(name: String): ZIO[ZConnection, Throwable, Unit] =
-    sql"""update __rel_managed_index set status = 'retired'::rel_index_status
-          where index_name = $name and status <> 'retired'::rel_index_status""".update.unit
 
   private def supersede(names: Seq[String]): ZIO[ZConnection, Throwable, Long] =
     (sql"""update __rel_managed_index set status = 'retiring'::rel_index_status
@@ -342,41 +418,93 @@ object IndexManager:
       .selectAll
       .map(_.toSeq)
 
-  private def runConcurrently(ddl: String): ZIO[ZConnectionPool, Throwable, Unit] =
+  private def withLifecycleLock[A](body: ZIO[ZConnection, Throwable, A]): ZIO[ZConnectionPool, Throwable, A] =
     ZIO.serviceWithZIO[ZConnectionPool] { pool =>
       ZIO.scoped {
-        pool.transaction.build.flatMap { env =>
-          env.get[ZConnection].access { c =>
-            val previous = c.getAutoCommit
-            c.setAutoCommit(true)
-            try
-              val statement = c.createStatement()
-              try
-                statement.execute(ddl)
-                ()
-              finally statement.close()
-            finally c.setAutoCommit(previous)
+        for
+          env <- pool.transaction.build
+          connection = env.get[ZConnection]
+          _ <- ZIO.acquireRelease(
+            (sql"set local lock_timeout = '30s'".execute *>
+              sql"select 1 from pg_advisory_lock(${ProjectionRegistry.projectionLockKey})".query[Int].selectOne)
+              .provideEnvironment(env)
+          ) { _ =>
+            (connection.rollback *>
+              sql"select pg_advisory_unlock(${ProjectionRegistry.projectionLockKey})"
+                .query[Boolean]
+                .selectOne
+                .provideEnvironment(env) *>
+              connection.access(_.commit())).catchAll(_ => pool.invalidate(connection))
           }
-        }
+          _      <- connection.access(_.commit())
+          result <- body.provideEnvironment(env)
+          _      <- connection.access(_.commit())
+        yield result
       }
     }
 
-  private def dropDdl(name: String): String = s"drop index concurrently if exists ${quoteIdent(name)}"
+  private def runConcurrently(ddl: String): ZIO[ZConnection, Throwable, Unit] =
+    ZIO.serviceWithZIO[ZConnection](_.access { c =>
+      val previous = c.getAutoCommit
+      if !previous then c.commit()
+      c.setAutoCommit(true)
+      try
+        val statement = c.createStatement()
+        try
+          statement.execute(ddl)
+          ()
+        finally statement.close()
+      finally c.setAutoCommit(previous)
+    })
+
+  private def currentSchema: ZIO[ZConnection, Throwable, String] =
+    sql"select current_schema()".query[String].selectOne.someOrFail(new RuntimeException("No current database schema"))
+
+  private def verifyOwnership(
+      schema: String,
+      name: String,
+      table: String,
+      expectedOid: Option[Long]
+  ): ZIO[ZConnection, Throwable, Unit] =
+    sql"""select c.oid::bigint, coalesce(t.relname, '')::text, coalesce(t.relnamespace = c.relnamespace, false)
+          from pg_class c join pg_namespace n on n.oid = c.relnamespace
+          left join pg_index i on i.indexrelid = c.oid left join pg_class t on t.oid = i.indrelid
+          where n.nspname = $schema and c.relname = $name"""
+      .query[(Long, String, Boolean)]
+      .selectOne
+      .flatMap {
+        case None => ZIO.unit
+        case Some((oid, actualTable, sameSchema))
+            if expectedOid.contains(oid) && (actualTable === table) && sameSchema =>
+          ZIO.unit
+        case _ =>
+          ZIO.fail(
+            new RuntimeException(s"Refusing to drop $schema.$name: physical index ownership is unverified or changed")
+          )
+      }
+
+  private def dropDdl(schema: String, name: String): String =
+    s"drop index concurrently if exists ${quoteIdent(schema)}.${quoteIdent(name)}"
+
+  private def dropIfInvalid(schema: String, idx: PlannedIndex): ZIO[ZConnection, Throwable, Unit] =
+    validateOne(idx).flatMap {
+      case Validation.Invalid(_) =>
+        runConcurrently(dropDdl(schema, idx.name)) *>
+          sql"""update __rel_managed_index set physical_oid = null, status = 'building', adopted = false
+                 where index_name = ${idx.name} and status <> 'retired'""".update.unit
+      case Validation.Mismatch(_) =>
+        ZIO.fail(new IllegalStateException(s"Refusing to replace mismatched managed index: ${idx.name}"))
+      case _ => ZIO.unit
+    }
 
   private def textArray(items: Seq[String]): SqlFragment =
     items match
       case Seq() => sql"array[]::text[]"
       case _     => sql"array[" ++ items.map(i => sql"$i").mkFragment(sql", ") ++ sql"]::text[]"
 
-  private def renderBuild(
-      planned: Plan,
-      failures: Seq[(String, Either[Throwable, Unit])],
-      rows: Seq[(Long, String, String, String, Boolean)]
-  ): String =
-    val failed = failures.collect { case (name, Left(error)) => s"  failed to build $name: ${error.getMessage}" }
-    val header =
-      s"Built ${planned.indexes.size} planned index(es); ${rows.count((_, _, _, s, _) => strEq(s, "valid"))} valid"
-    (Seq(header) ++ failed ++ planned.diagnostics.map("  " + _) ++ planned.notes.map("  " + _))
+  private def renderBuild(planned: Plan): String =
+    (Seq(s"Validated ${planned.indexes.size} planned index(es)") ++
+      planned.diagnostics.map("  " + _) ++ planned.notes.map("  " + _))
       .mkString(System.lineSeparator)
 
   private def renderPlan(planned: Plan): String =
