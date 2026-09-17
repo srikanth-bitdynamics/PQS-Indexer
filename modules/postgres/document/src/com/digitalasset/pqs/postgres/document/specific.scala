@@ -6,8 +6,9 @@ package com.digitalasset.pqs.postgres.document
 import com.digitalasset.canonical
 import com.digitalasset.canonical.specific.{EventId, NodeId, Offset}
 import com.digitalasset.canonical.{ContractId, DomainId, Party}
+import com.digitalasset.pqs.postgres.backend.IdPlaceholder
+import com.digitalasset.pqs.postgres.document.model
 import com.digitalasset.pqs.postgres.document.model.given
-import com.digitalasset.pqs.postgres.document.{IdPlaceholder, model}
 import com.digitalasset.transcode.schema.ChoiceName
 import ujson.Value
 import zio.config.magnolia.Descriptor
