@@ -99,21 +99,35 @@ trait Pqs {
     Docker & Parties & Postgres & Database & Service[Ledger] & DeployedDar,
     Throwable,
     Service[Pipeline]
-  ] = conf.flatMap(conf =>
-    Docker
-      .service[Pipeline](
-        image = image,
-        env = conf.get._1,
-        prepopulateFiles = conf.get._2,
-        exposePorts = Set(Pipeline.healthPort),
-        user = user
-      )(
-        "pipeline",
-        "ledger",
-        "postgres-document",
-        extraArgs
-      )
-  )
+  ] = attemptPipelineOn("postgres-document", Map.empty, extraArgs)
+
+  def attemptRelationalPipeline(extraArgs: String*): ZLayer[
+    Docker & Parties & Postgres & Database & Service[Ledger] & DeployedDar,
+    Throwable,
+    Service[Pipeline]
+  ] =
+    attemptPipelineOn("postgres-relational", Map(s"${envPrefix}TARGET_POSTGRES_SCHEMA" -> "pqs_relational"), extraArgs)
+
+  private def attemptPipelineOn(
+      backend: String,
+      extraEnv: Map[String, String],
+      extraArgs: Seq[String]
+  ): ZLayer[Docker & Parties & Postgres & Database & Service[Ledger] & DeployedDar, Throwable, Service[Pipeline]] =
+    conf.flatMap(conf =>
+      Docker
+        .service[Pipeline](
+          image = image,
+          env = conf.get._1 ++ extraEnv,
+          prepopulateFiles = conf.get._2,
+          exposePorts = Set(Pipeline.healthPort),
+          user = user
+        )(
+          "pipeline",
+          "ledger",
+          backend,
+          extraArgs
+        )
+    )
 
   def prune(extraArgs: String*): ZLayer[
     Docker & Parties & Postgres & Database & Service[Ledger] & DeployedDar,
@@ -237,6 +251,13 @@ trait Pqs {
     Throwable,
     CliRun
   ] = attemptPipeline(extraArgs*).flatMap(CliRun.fromSvcExpectSuccess)
+
+  /** Run the relational-backend pipeline (targets the `pqs_relational` schema) and wrap the result into a Layer. */
+  def runRelationalPipeline(extraArgs: String*): ZLayer[
+    Docker & Parties & Postgres & Database & Service[Ledger] & DeployedDar,
+    Throwable,
+    CliRun
+  ] = attemptRelationalPipeline(extraArgs*).flatMap(CliRun.fromSvcExpectSuccess)
 
   def runPrune(extraArgs: String*): ZLayer[
     Docker & Parties & Postgres & Database & Service[Ledger] & DeployedDar,
