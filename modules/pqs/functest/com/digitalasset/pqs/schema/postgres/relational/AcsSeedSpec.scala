@@ -65,7 +65,7 @@ object AcsSeedSpec extends SharedLedgerAndPostgresTest:
               from pqs_relational.__rel_transactions where tx_ix = 0 and ledger_offset > 0
             union all select 'acs_coverage', count(*)::text
               from pqs_relational.__query_coverage
-              where acs_seed_offset is not null and tree_stream = true and reassignment_history_complete = false
+              where acs_seed_offset is not null and tree_stream = true and reassignment_history_complete = true
             order by k
           """) `returns` table {
             "key"                 | "count"

@@ -33,14 +33,27 @@ begin
         raise exception '__rel_watermark.tx_ix and __rel_watermark.ledger_offset must not be null';
     end if;
 
-    with drained as (
-        delete from __rel_tmp_lifecycle where archived_tx_ix <= new.tx_ix
-            returning contract_id, archived_tx_ix, archived_at_offset)
+    -- Keep archives whose create/assignment has not arrived yet; streams across synchronizers can be non-causal.
     update __rel_contracts c
-    set archived_tx_ix     = d.archived_tx_ix,
-        archived_at_offset = d.archived_at_offset
-    from drained d
-    where c.contract_id = d.contract_id and c.archived_tx_ix is null;
+    set archived_tx_ix = d.archived_tx_ix, archived_at_offset = d.archived_at_offset
+    from (
+        select distinct on (contract_id) contract_id, archived_tx_ix, archived_at_offset
+        from __rel_tmp_lifecycle where archived_tx_ix <= new.tx_ix
+        order by contract_id, archived_tx_ix
+    ) d
+    where c.contract_id = d.contract_id and c.created_tx_ix <= new.tx_ix
+      and (c.archived_tx_ix is null or d.archived_tx_ix < c.archived_tx_ix);
+
+    delete from __rel_tmp_lifecycle d
+    using __rel_contracts c
+    where c.contract_id = d.contract_id and c.created_tx_ix <= new.tx_ix and d.archived_tx_ix <= new.tx_ix;
+
+    insert into __rel_contract_visibility(contract_pk, party, role)
+    select c.contract_pk, v.party, v.role from __rel_pending_visibility v
+    join __rel_contracts c using (contract_id)
+    where v.tx_ix <= new.tx_ix and c.created_tx_ix <= new.tx_ix and c.redaction_id is null
+    on conflict do nothing;
+    delete from __rel_pending_visibility where tx_ix <= new.tx_ix;
 
     update __query_coverage
     set through_offset = new.ledger_offset
@@ -83,3 +96,10 @@ from __rel_contracts c
 where c.life_ix @> latest_ix()
   and not c.divulged_only
   and c.redaction_id is null;
+
+create or replace view reassignments as
+select e.ledger_offset, e.node_id, e.tx_ix, e.contract_id, e.event_kind,
+       r.reassignment_id, r.source_synchronizer_id, r.target_synchronizer_id,
+       r.submitter, r.reassignment_counter, r.assignment_exclusivity
+from __query_events e join __rel_reassignments r using (event_pk)
+where e.ledger_offset between oldest_offset() and latest_offset();

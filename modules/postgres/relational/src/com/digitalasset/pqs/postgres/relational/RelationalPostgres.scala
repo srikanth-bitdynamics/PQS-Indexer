@@ -90,7 +90,7 @@ final case class RelationalPostgres(
                 ${record.actualStart.toSqlValue}, ${Option.empty[Long]},
                 (select ledger_offset from __rel_transactions where tx_ix = 0),
                 $allParties, ${parties}::text[], ${record.contractFilter}, ${record.metadataFilter}, $treeStream,
-                true, $treeStream, true, true, false, false, now(), null)""".update.unit
+                true, $treeStream, true, true, true, true, now(), null)""".update.unit
     )
 
   override def processAcs = (
@@ -201,7 +201,13 @@ final case class RelationalPostgres(
         val onlyTxs = models.onlyTransactions()
         ZIO.attempt {
           traces.span("execute batch") {
-            (WriterFence.check(fenceIdentity) *> model.Model.prepareStatement(models, model.statTables))
+            (WriterFence.check(fenceIdentity) *> ContractObservations
+              .prepare(models)
+              .flatMap(normalized =>
+                model.Model
+                  .prepareStatement(normalized, model.statTables)
+                  .tap(_ => ContractObservations.finish(models))
+              ))
               @@ trackExecute
               @@ traces.attributes("pqs.batch.models_count" -> models.length.toLong)
               <* ZIO.foreachDiscard(onlyTxs) { tx =>
@@ -359,8 +365,8 @@ final case class RelationalPostgres(
           // the contract reuses its create event's pk, so a create allocates one id, not two
           val contractPk = eventPk
           val historyLowerBound = sourceKind match
-            case model.SourceKind.AcsSeed => true
-            case _                        => false
+            case model.SourceKind.AcsSeed | model.SourceKind.Assignment => true
+            case _                                                      => false
           val contract = model.Contract(
             specific.Contract(
               contractPk = contractPk,
@@ -370,8 +376,8 @@ final case class RelationalPostgres(
               creationPackageId = c.creationPackageId,
               createdAtIx = txIx,
               createdAtOffset = sourceKind match
-                case model.SourceKind.AcsSeed => None
-                case _                        => Some(c.eventId._1),
+                case model.SourceKind.AcsSeed | model.SourceKind.Assignment => None
+                case _                                                      => Some(c.eventId._1),
               signatories = c.signatories,
               observers = c.observers,
               createWitnesses = c.witnesses,
@@ -450,8 +456,50 @@ final case class RelationalPostgres(
           exercise
         ) ++ eventVisibility(e.witnesses) ++ lifecycle
 
-      case _: ReassignmentEvent =>
-        Chunk.empty
+      case a: canonical.specific.Event.Assigned =>
+        val created = a.created.getOrElse(
+          throw new IllegalArgumentException(
+            s"assignment ${a.reassignmentId} has no template payload for ${a.contractId}"
+          )
+        )
+        val rows = insertEvent(txIx, model.SourceKind.Assignment, None, created.copy(acsDelta = true))
+        val assigned = rows
+          .collectFirst { case e: model.Event => e.ev }
+          .getOrElse(
+            throw new IllegalArgumentException(
+              s"assignment ${a.reassignmentId} has no known template for ${a.contractId}"
+            )
+          )
+        rows.map {
+          case _: model.Event => model.Event(assigned.copy(eventKind = model.EventKind.Assign, sourceKind = sourceKind))
+          case other          => other
+        } :+ model.Reassignment(
+          specific.Reassignment(
+            assigned.pk,
+            a.reassignmentId,
+            a.source,
+            a.target,
+            a.submitter,
+            a.reassignmentCounter,
+            None
+          )
+        )
+
+      case u: canonical.specific.Event.Unassigned =>
+        Chunk(
+          eventRow(u.eventId, u.contractId, getEntityPk(u.templateId), model.EventKind.Unassign, None),
+          model.Reassignment(
+            specific.Reassignment(
+              eventPk,
+              u.reassignmentId,
+              u.source,
+              u.target,
+              u.submitter,
+              u.reassignmentCounter,
+              u.assignmentExclusivity
+            )
+          )
+        ) ++ eventVisibility(u.witnesses)
   }
 end RelationalPostgres
 

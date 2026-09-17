@@ -29,11 +29,11 @@ import zio.config.magnolia.{Descriptor, describe}
 import zio.jdbc.*
 import zio.{ZIO, ZLayer}
 
-object Main extends RelationalIndexCli:
+object Main extends RelationalIndexCli with RelationalMaintenanceCli:
   def app =
     "postgres-relational"
       @@ Command("Perform operations supporting Postgres database (w/ relational payload representation)")
-      - (appSchema | appProjection)
+      - (appSchema | appProjection | maintenanceCommand)
 
   private def appSchema =
     "schema" @@ Command("Infer or apply database schema derived from Daml package metadata")

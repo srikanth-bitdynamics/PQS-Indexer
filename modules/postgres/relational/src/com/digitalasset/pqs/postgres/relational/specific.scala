@@ -151,6 +151,26 @@ object specific:
       controllers
     )(argument)(result)(lastDescendant)
 
+  final case class Reassignment(
+      eventPk: IdPlaceholder,
+      reassignmentId: String,
+      source: String,
+      target: String,
+      submitter: Option[String],
+      counter: Long,
+      exclusivity: Option[Instant]
+  ):
+    val columns = Seq(
+      "event_pk",
+      "reassignment_id",
+      "source_synchronizer_id",
+      "target_synchronizer_id",
+      "submitter",
+      "reassignment_counter",
+      "assignment_exclusivity"
+    )
+    val rowValues = model.values(eventPk)(reassignmentId)(source)(target)(submitter)(counter)(exclusivity)
+
   final case class TmpLifecycle(contractId: ContractId, archivedTxIx: Long, archivedAtOffset: Option[Long]):
     val columns   = Seq("contract_id", "archived_tx_ix", "archived_at_offset")
     val rowValues = model.values(contractId)(archivedTxIx)(archivedAtOffset)

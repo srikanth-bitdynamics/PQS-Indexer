@@ -38,6 +38,20 @@ Commands:
 Run 'pqs datastore COMMAND --help[-verbose]' for more information on a command.
 """
     },
+    verify(App, Array("datastore", "postgres-relational", HelpFlag)) {
+      """Usage: pqs datastore postgres-relational COMMAND
+
+Perform operations supporting Postgres database (w/ relational payload representation)
+
+Commands:
+  schema        Infer or apply database schema derived from Daml package metadata
+  projection    Manage relational typed-column projections
+  prune         Remove archived relational history through an offset; stop ingestion first
+  redact        Remove stored payloads; stop ingestion first
+
+Run 'pqs datastore postgres-relational COMMAND --help[-verbose]' for more information on a command.
+"""
+    },
     verify(App, Array("datastore", "postgres-document", HelpFlag)) {
       """Usage: pqs datastore postgres-document COMMAND
 

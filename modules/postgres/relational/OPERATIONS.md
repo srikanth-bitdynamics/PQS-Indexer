@@ -34,8 +34,37 @@ The relational backend is still in development and has a single initial migratio
 
 PostgreSQL logical restores can change physical OIDs. After a restore, stop ingestion and reconcile managed index identities against actual definitions before allowing retirement. Do not blindly erase identities to force an adoption.
 
+## Reassignments
+
+The subscription includes assignment and unassignment events in both flat and tree stream modes. The `reassignments` SQL view exposes the source and target synchronizers, reassignment ID and counter, submitter, and assignment exclusivity time when supplied. Reassignment updates have no transaction effective time; `effective_at` remains NULL.
+
+A move does not globally archive a contract. Repeated assignments retain one contract identity and payload. If an assignment is the first observation, its embedded created event supplies the payload, but `created_at_offset` stays NULL and `history_lower_bound` is true: the original creation was not observed. A missing template payload fails ingestion explicitly. Reassignment completeness applies only to the subscribed coverage interval and parties; it does not imply knowledge of earlier history or global per-synchronizer availability.
+
+Concurrent observations of the same contract are serialized with transaction advisory locks. PostgreSQL shared lock capacity must accommodate the distinct contracts in concurrently executing batches, especially a single large ledger transaction. Include `max_locks_per_transaction` and ingest concurrency in capacity testing.
+
+Non-causal delivery can expose an archive before its create or assignment. Pending archives survive watermark advances until matched. An archive preceding the earliest observed state produces an empty lifetime, so it cannot resurrect an active contract.
+
+## Pruning and redaction
+
+Stop ingestion before maintenance. Each operation runs in one database transaction and acquires the projection, writer, and activity locks used by the backend. A live writer is rejected. Backfill and projection changes are serialized with maintenance. Use the database credentials and schema of the relational store, typically `--postgres-schema=pqs_relational`; the examples below omit connection options.
+
+```sh
+pqs datastore postgres-relational prune --prune-offset=12345
+pqs datastore postgres-relational prune --prune-offset=12345 --prune-mode=Force
+pqs datastore postgres-relational redact contract --redact-contractid='<contract-id>' --redact-redactionid='<request-id>'
+pqs datastore postgres-relational redact exercise --redact-offset=12345 --redact-node=0 --redact-redactionid='<request-id>'
+```
+
+Pruning defaults to a dry run reporting row counts. Force removes contracts first observed and archived through the inclusive offset, their payloads and interface rows, and eligible exercise, movement, visibility, event, and transaction history. Active contracts, their original create events, retained lifecycle references, and a restart checkpoint survive. Offsets beyond the published watermark are rejected. Reads below the retained boundary are rejected, including an already configured session offset. Repeating a completed prune is a no-op. Coverage records indicate the loss of historical completeness.
+
+Minimal contract-ID tombstones prevent late assignments from recreating a pruned archived contract. Tombstones and redaction audit records are intentionally retained; include their growth in capacity planning. Pruning does not prune the participant ledger, and this command accepts an offset rather than a time or duration.
+
+Contract redaction requires a published, archived contract. It deletes whole template and interface payload rows, including promoted fields and their index entries; clears the key, key hash and created-event blob; and removes stored exercise arguments and results for the contract. Exercise redaction can instead target a single event by offset and node. Both keep an audit request ID. Repeating the same request is a no-op; a different request for an already redacted item is rejected. Later ingestion and backfill must not restore redacted values.
+
+Redaction retains contract identity, parties, lifecycle and movement metadata. It is payload removal, not anonymization or immediate physical erasure from PostgreSQL pages, WAL, replicas or backups. Their retention must be managed separately. Readers holding older database snapshots can continue seeing their snapshot until it ends.
+
+Maintenance is atomic and currently runs as one transaction, so a large prune needs a maintenance window with sufficient WAL and disk headroom. Chunked online pruning is not implemented. Measure representative workloads before choosing a production retention schedule.
+
 ## Remaining production acceptance work
 
-Four functional tests verify create/reassign/archive and ACS-seeded/archive lifecycles with both flat and tree streams on this branch. Reassignment does not globally archive the contract, and coverage flags remain partial. These tests do not establish complete assignment history or cover the non-causal event ordering added by newer upstream commits.
-
-Relational pruning/redaction operations, document-to-relational migration tooling, upstream reassignment integration, and the proposal's scale benchmark remain separate deliverables. Backfill honors existing redaction markers, but that is not a complete redaction workflow. A complete functional rerun and measured workload results are required before release.
+Document-to-relational migration tooling and the proposal's scale benchmark remain separate deliverables. A complete functional rerun and measured workload results are required before release. Reassignment tests exercise real Canton streams; additional database tests cover duplicate and concurrent observations, non-causal lifecycle delivery, maintenance locking, and protection against restoring removed payloads.
