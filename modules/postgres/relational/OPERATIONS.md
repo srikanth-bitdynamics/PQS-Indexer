@@ -1,6 +1,6 @@
 # Relational projection operations
 
-This backend currently exposes SQL views. It does not implement the proposal's HTTP Query API.
+The relational backend exposes SQL views. An HTTP Query API and document-to-relational migration tooling are not available.
 
 ## Compatible upgrades
 
@@ -16,7 +16,7 @@ Backfill holds the projection session lock across chunk commits. Concurrent appl
 
 Republishing uses `CREATE OR REPLACE VIEW`, retaining the view identity, owner, table and column grants, comments, and dependent views. Existing column positions remain stable. New columns are appended, including after `payload_json` when that column already exists. Consumers should name their columns explicitly.
 
-Removing a published field or template is intentionally rejected. Leaving an orphaned view would expose typed values that the new writer no longer maintains. To narrow an internal query workload without changing the public contract, retain the published fields in the projection and reduce its configured queries/indexes.
+Removing a published field or template is intentionally rejected. Leaving an orphaned view would expose typed values that the new writer no longer maintains. To narrow a query workload without changing the public contract, retain the published fields in the projection and reduce its configured queries/indexes.
 
 A breaking public change requires a consumer migration during a maintenance window: identify dependent views and grants, migrate the consumers, explicitly remove the obsolete view using `DROP VIEW ... RESTRICT`, and activate the new projection. Reapply the intended grants to any newly created view. Activation never uses `CASCADE` and never drops consumers automatically. There is currently no dedicated CLI command for this breaking migration.
 
@@ -30,7 +30,7 @@ The writer holds a dedicated liveness connection. Each data transaction verifies
 
 Run build, validate/adopt, then retire. Existing index coverage is retained until every replacement validates. Retiring indexes needed by the current plan can be rebuilt/adopted. An invalid managed index is recreated only after its physical definition and identity match the registry; a same-name external replacement is rejected. Recreating an index records its new physical OID.
 
-The relational backend is still in development and has a single initial migration, V001, including managed index physical identities (`physical_oid`). V001 has the standard copyright header. Recreate development databases initialized with an earlier revision of V001 before testing this consolidated schema.
+The relational schema starts with migration V001. Databases initialized with an earlier development revision of V001 must be recreated; there is no migration between those revisions.
 
 PostgreSQL logical restores can change physical OIDs. After a restore, stop ingestion and reconcile managed index identities against actual definitions before allowing retirement. Do not blindly erase identities to force an adoption.
 
@@ -63,8 +63,4 @@ Contract redaction requires a published, archived contract. It deletes whole tem
 
 Redaction retains contract identity, parties, lifecycle and movement metadata. It is payload removal, not anonymization or immediate physical erasure from PostgreSQL pages, WAL, replicas or backups. Their retention must be managed separately. Readers holding older database snapshots can continue seeing their snapshot until it ends.
 
-Maintenance is atomic and currently runs as one transaction, so a large prune needs a maintenance window with sufficient WAL and disk headroom. Chunked online pruning is not implemented. Measure representative workloads before choosing a production retention schedule.
-
-## Remaining production acceptance work
-
-Document-to-relational migration tooling and the proposal's scale benchmark remain separate deliverables. A complete functional rerun and measured workload results are required before release. Reassignment tests exercise real Canton streams; additional database tests cover duplicate and concurrent observations, non-causal lifecycle delivery, maintenance locking, and protection against restoring removed payloads.
+Maintenance is atomic and currently runs as one transaction, so a large prune needs a maintenance window with sufficient WAL and disk headroom. Chunked online pruning is not implemented. Production-scale performance has not yet been established. Measure representative workloads before choosing a production retention schedule.
