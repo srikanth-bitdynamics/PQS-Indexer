@@ -51,6 +51,9 @@ final case class RelationalPostgres(
   private val ReservedConnections           = 1
   private val IngestParallelism             = math.max(1, poolConfig.maxConnections - ReservedConnections)
 
+  private val commitBatch: ZIO[ZConnection, Throwable, Unit] =
+    ZIO.serviceWithZIO[ZConnection](_.access(c => if !c.getAutoCommit then c.commit()))
+
   override def capabilities = Datastore.Capabilities(reassignments = false, coverage = true)
 
   override def registerActiveWriterAndCleanupTransactions = tx(
@@ -196,7 +199,8 @@ final case class RelationalPostgres(
         val onlyTxs = models.onlyTransactions()
         ZIO.attempt {
           traces.span("execute batch") {
-            (sql"call __rel_ensure_writer_valid()".execute *> model.Model.prepareStatement(models, model.statTables))
+            (sql"call __rel_ensure_writer_valid()".execute *> model.Model.prepareStatement(models, model.statTables)
+              <* commitBatch)
               @@ trackExecute
               @@ traces.attributes("pqs.batch.models_count" -> models.length.toLong)
               <* ZIO.foreachDiscard(onlyTxs) { tx =>
