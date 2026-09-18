@@ -24,10 +24,12 @@ object ProjectionBinding:
         shape.lineage,
         throw new IllegalArgumentException(s"projection $qualified is absent from the current package dictionary")
       )
+      val byPosition = available.promoted.map(field => field.position -> field).toMap
       val fields = shape.promoted.map { field =>
-        available.promoted
-          .find { candidate =>
-            candidate.position == field.position && (candidate.name === field.name) &&
+        byPosition
+          .get(field.position)
+          .filter { candidate =>
+            (candidate.name === field.name) &&
             (candidate.pgType === field.pgType) && candidate.nullable == field.nullable &&
             field.damlType.forall(t => candidate.damlType.contains(t)) &&
             ((field.enumCases, candidate.enumCases) match
