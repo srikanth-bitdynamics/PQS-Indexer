@@ -1,8 +1,8 @@
 -- Copyright (c) 2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
 -- SPDX-License-Identifier: Apache-2.0
 
-create type rel_event_kind as enum ('create', 'exercise', 'archive');
-create type rel_source_kind as enum ('stream', 'acs_seed', 'ledger_replay', 'document_backfill');
+create type rel_event_kind as enum ('create', 'exercise', 'archive', 'assign', 'unassign');
+create type rel_source_kind as enum ('stream', 'acs_seed', 'ledger_replay', 'document_backfill', 'assignment');
 create type rel_archive_source as enum ('native', 'consuming_exercise');
 create type rel_visibility_role as enum ('signatory', 'observer', 'witness');
 create type rel_projection_status as enum ('draft', 'active', 'retired');
@@ -77,7 +77,7 @@ create table __rel_contracts (
     archived_tx_ix            bigint,
     created_at_offset         bigint,
     archived_at_offset        bigint,
-    life_ix                   int8range generated always as (int8range(created_tx_ix, archived_tx_ix, '[)')) stored,
+    life_ix                   int8range generated always as (case when archived_tx_ix < created_tx_ix then 'empty'::int8range else int8range(created_tx_ix, archived_tx_ix, '[)') end) stored,
     signatories               text[] not null default '{}',
     observers                 text[] not null default '{}',
     create_witnesses          text[] not null default '{}',
@@ -116,6 +116,15 @@ create table __rel_contract_visibility (
     party       text not null,
     role        rel_visibility_role not null,
     primary key (contract_pk, party, role)
+);
+
+-- Visibility from repeated observations becomes readable only at the published watermark.
+create table __rel_pending_visibility (
+    contract_id text not null,
+    party       text not null,
+    role        rel_visibility_role not null,
+    tx_ix       bigint not null,
+    primary key (tx_ix, contract_id, party, role)
 );
 
 create table __rel_exercises (
@@ -232,3 +241,21 @@ create unique index __query_projection_active_idx on __query_projection ((true))
 
 insert into __rel_watermark (singleton) values (true) on conflict do nothing;
 insert into __rel_pruning_metadata (singleton) values (true) on conflict do nothing;
+
+create table __rel_reassignments (
+    event_pk bigint primary key,
+    reassignment_id text not null,
+    source_synchronizer_id text not null,
+    target_synchronizer_id text not null,
+    submitter text,
+    reassignment_counter bigint not null,
+    assignment_exclusivity timestamptz
+);
+
+-- Retain only the identity of pruned archived contracts so a delayed assignment cannot resurrect their payload.
+create table __rel_contract_tombstone (
+    contract_id text primary key
+);
+create index __rel_redaction_contract_idx on __rel_redaction (contract_id);
+create index __rel_redaction_event_idx on __rel_redaction (event_id_offset, event_id_node);
+create index __rel_tmp_lifecycle_contract_idx on __rel_tmp_lifecycle (contract_id);

@@ -185,6 +185,16 @@ object UpdateServiceSpec extends ZIOSpecDefault:
           )
         )
       ,
+      test("getTransactions - populates domainId from the synchronizer id"):
+        val withSync = GetUpdatesResponse.defaultInstance.withTransaction(
+          Transaction.defaultInstance.withOffset(first).withSynchronizerId("sync-1")
+        )
+        val expectations = GetUpdates(anything, value(ZStream.succeed(withSync)))
+        ZIO.provideLayer(serviceLayer(expectations.toLayer))(for
+          service <- ZIO.service[UpdateService]
+          result  <- service.getTransactions(dummyRight, offset(first), offset(first)).map(_.domainId).runCollect
+        yield assertTrue(result == Chunk(Some(DomainId("sync-1")))))
+      ,
       test("getTransactionTrees - works with the same offsets - shape is LEDGER_EFFECTS"):
         val streamResponse = ZStream.succeed(response(first)) ++ ZStream.succeed(response(second))
 
@@ -259,20 +269,5 @@ object UpdateServiceSpec extends ZIOSpecDefault:
             result.head.effectiveAt.contains(TimestampConverters.asJavaInstant(effectiveAt))
           )
         )
-      ,
-      test("getTransactions - populates domainId from the synchronizer id"):
-        val withSync = GetUpdatesResponse.defaultInstance.withTransaction(
-          Transaction.defaultInstance.withOffset(first).withSynchronizerId("sync-1")
-        )
-        val expectations = GetUpdates(anything, value(ZStream.succeed(withSync)))
-        (for
-          service <- ZIO.service[UpdateService]
-          result <- service
-            .getTransactions(dummyRight, offset(first), offset(first))
-            .map(_.domainId)
-            .runCollect
-        yield assertTrue(
-          result == Chunk(Some(DomainId("sync-1")))
-        )).provideLayer(serviceLayer(expectations.toLayer))
     )
   )

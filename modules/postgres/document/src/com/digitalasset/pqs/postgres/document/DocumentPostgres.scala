@@ -11,7 +11,7 @@ import com.digitalasset.pqs.o11y.metrics.latency
 import com.digitalasset.pqs.o11y.traces
 import com.digitalasset.pqs.o11y.traces.given
 import com.digitalasset.pqs.postgres.backend.*
-import com.digitalasset.pqs.postgres.backend.{transact as transaction}
+import com.digitalasset.pqs.postgres.backend.{copy as writer, transact as transaction}
 import com.digitalasset.pqs.postgres.document.model.{EntityTypePk, PackagePk, Watermark}
 import com.digitalasset.pqs.postgres.document.specific.*
 import com.digitalasset.transcode.Codec
@@ -26,14 +26,11 @@ import ujson.Value
 import zio.ZIO.{logDebug, logInfo, logTrace}
 import zio.jdbc.*
 import zio.jdbc.SqlFragment.{Segment, Setter}
-import zio.metrics.Metric
-import zio.metrics.MetricKeyType.Histogram.Boundaries
 import zio.stream.{ZChannel, ZPipeline, ZSink}
-import zio.{Chunk, ChunkBuilder, Schedule, ZEnvironment, ZIO, ZLayer, durationInt, jdbc}
+import zio.{Chunk, ZEnvironment, ZIO, ZLayer, jdbc}
 
 import java.io.{Reader, StringReader}
 import java.util
-import scala.collection.mutable
 import scala.jdk.CollectionConverters.*
 import scala.language.implicitConversions
 import scala.util.Using
@@ -55,8 +52,6 @@ final case class DocumentPostgres(
   private val env                           = ZEnvironment(pool) ++ ZEnvironment(poolConfig)
   private def tx[A](effect: ZIO[ZConnection, Throwable, A]): ZIO[Any, Throwable, A] =
     transaction(effect).provideEnvironment(env)
-  private val BatchEntitiesThreshold = 10_000
-  private val BatchReleaseWindow     = 200.millis
 
   override def registerActiveWriterAndCleanupTransactions = tx(
     sql"call __cleanup_transactions_after_watermark()".execute
@@ -74,14 +69,14 @@ final case class DocumentPostgres(
     waitPoint("pipeline_wp_acs_events", poolConfig.bufferSize, 1024 min poolConfig.bufferSize)
       >>> convertAcsEventsToStatements
       >>> waitPoint("pipeline_wp_acs_statements", poolConfig.bufferSize, 1024 min poolConfig.bufferSize)
-      >>> batchStatements
+      >>> writer.batchStatements
       >>> waitPoint("pipeline_wp_acs_batched_statements")
       >>> prepareStatements
       >>> waitPoint("pipeline_wp_acs_prepared_statements")
       >>> executePar(16)
       >>> ZPipeline.flattenChunks
       >>> updateAcsOffsets
-      >>> handleWatermarks
+      >>> writer.handleWatermarks(updateWatermark)
       >>> ZSink.drain
   ).provideEnvironment(env)
 
@@ -89,14 +84,14 @@ final case class DocumentPostgres(
     waitPoint("pipeline_wp_events", poolConfig.bufferSize, 1024 min poolConfig.bufferSize)
       >>> convertTransactionEventsToStatements(8)
       >>> waitPoint("pipeline_wp_statements", poolConfig.bufferSize, 1024 min poolConfig.bufferSize)
-      >>> batchStatements
+      >>> writer.batchStatements
       >>> waitPoint("pipeline_wp_batched_statements")
       >>> prepareStatements
       >>> waitPoint("pipeline_wp_prepared_statements")
       >>> executeParUnordered(poolConfig.maxConnections)
       >>> waitPoint("pipeline_wp_watermarks", 1024)
-      >>> reorderCheckpoints
-      >>> handleWatermarks
+      >>> writer.reorderCheckpoints(getLastCheckpoint.map(cp => model.Watermark(cp._2, cp._1, Seq.empty)))
+      >>> writer.handleWatermarks(updateWatermark)
       >>> ZSink.drain
   ).provideEnvironment(env)
 
@@ -148,28 +143,6 @@ final case class DocumentPostgres(
       )
       .tap(x => logDebug(s"Converted ${x.length} transaction events to SQL fragments"))
 
-  /** Groups multiple SQL actions into large batches of SQL IO to be executed in single transactions unordered. */
-  private def batchStatements =
-    ZPipeline[Chunk[model.Model]]
-      .aggregateAsyncWithin(
-        ZSink.foldChunks( // start with:
-          ChunkBuilder.make[model.Model]() -> 0
-        ) { // continue while:
-          (acc, size) => size < BatchEntitiesThreshold
-        } { // accumulate:
-          case ((acc, size), in) =>
-            var s = size
-            for chunk <- in; elem <- chunk do { acc.addOne(elem); s += 1 }
-            (acc, s)
-        },
-        Schedule.spaced(BatchReleaseWindow) // release batch regularly even if not full
-      )
-      .map(_._1.result())
-      .tap { models =>
-        ZIO.foreachDiscard(models.onlyTransactions())(_.ifTraced(_.addEvent("released transaction model into batch")))
-      }
-      .tap(x => logDebug(s"Aggregated ${x.length} SQL fragments into single batch"))
-
   private def prepareStatements =
     val trackPrepare = latency("pipeline_prepare_batch_latency", "Latency of preparing batches of statements")
     val trackExecute = latency("pipeline_execute_batch_latency", "Latency of executing batches of statements")
@@ -193,83 +166,6 @@ final case class DocumentPostgres(
         } <* ZIO.foreachDiscard(onlyTxs)(_.ifTraced(_.addEvent("prepared SQL statements for transaction model")))
       } @@ trackPrepare
     }
-
-  /** Upstream statements were executed out of order, this pipeline restores the consecutive order of indexes */
-  private def reorderCheckpoints =
-    type AccumulatorChannel =
-      ZChannel[Any, Nothing, Chunk[Chunk[model.Watermark]], Any, Nothing, Chunk[model.Watermark], Unit]
-    def accumulator(state: mutable.ArrayBuffer[model.Watermark]): AccumulatorChannel = ZChannel.readWithCause(
-      in => {
-        for chunk <- in do state.addAll(chunk)
-        state.sortInPlace()
-        val consecutive = (state.view zip state.view.drop(1)).takeWhile { (prev, next) => prev.ix + 1 == next.ix }
-        consecutive.lastOption match
-          case Some((_, value)) =>
-            // Gather all span refs (to individual txs & batches) up to advancing watermark
-            // ignoring head of `state` since it had already advanced by now
-            val advancing = state.view.slice(1, consecutive.size + 1)
-            val seenAts   = advancing.map(_.seenAts).fold(Seq.empty)(_ ++ _)
-            val txs       = advancing.map(_.txSpans).fold(Seq.empty)(_ ++ _)
-            val batches   = advancing.map(_.persistSpans).fold(Seq.empty)(_ ++ _).distinct
-            // `value` becomes the new head of `state` :)
-            state.remove(0, consecutive.size)
-            val effectiveWatermark = value.copy(seenAts = seenAts, txSpans = txs, persistSpans = batches)
-            ZChannel.write(Chunk(effectiveWatermark)) *> accumulator(state)
-          case None =>
-            accumulator(state)
-      },
-      err => ZChannel.refailCause(err),
-      _ => ZChannel.unit
-    )
-    ZPipeline.unwrap(
-      getLastCheckpoint
-        .map(cp => model.Watermark(cp._2, cp._1, Seq.empty))
-        .map(start =>
-          ZPipeline.fromChannel[Any, Nothing, Chunk[model.Watermark], model.Watermark](
-            accumulator(mutable.ArrayBuffer(start))
-          )
-        )
-    )
-
-  /** Update watermarks */
-  private def handleWatermarks =
-    val trackWatermark = latency("pipeline_progress_watermark", "Latency of watermark progression")
-    val watermarkIx = Metric
-      .gauge("watermark_ix", "Current watermark index (transaction ordinal number for consistent reads)")
-      .contramap[Long](_.toDouble)
-    val txProcessingLatency = Metric
-      .histogram(
-        "total_tx_handling_latency",
-        "Total transaction handling latency in pqs",
-        Boundaries.exponential(0.001, math.pow(10, 1.0 / 3), 13)
-      )
-      .contramap[Long](_.toDouble / 1e9)
-    ZPipeline[model.Watermark].mapZIO(wm =>
-      traces.span("advance datastore watermark") {
-        trackWatermark(updateWatermark(wm))
-          @@ traces.attributes(
-            "pqs.watermark.offset" -> wm.offset.toSqlValue,
-            "pqs.watermark.ix"     -> wm.ix
-          )
-          *> ZIO.foreachDiscard(wm.txSpans) { s =>
-            s.linkToCurrentSpan("target" -> "↧ advance watermark")
-              *> s.addEvent(
-                "advanced datastore watermark",
-                "offset" -> wm.offset.toSqlValue,
-                "index"  -> wm.ix
-              )
-              *> s.end()
-          }
-          *> ZIO.foreachDiscard(wm.persistSpans) { s =>
-            ZIO.unit @@ traces.link(s, "target" -> "↥ persist to datastore")
-          }
-          *> zio.Clock.nanoTime.flatMap(now =>
-            ZIO.foreachDiscard(wm.seenAts) { seenAt => txProcessingLatency.update(now - seenAt) }
-          )
-          *> watermarkIx.update(wm.ix)
-          *> logInfo(s"Advanced watermark: ix = ${wm.ix}, offset = ${wm.offset.toSqlValue}")
-      }
-    )
 
   private def updateWatermark(wm: Watermark) =
     tx(sql"""update __watermark set "offset" = ${wm.offset.toSqlValue}, ix = ${wm.ix};""".update)

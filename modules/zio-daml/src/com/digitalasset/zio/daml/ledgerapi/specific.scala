@@ -32,7 +32,7 @@ object specific:
 
   def convertReassignmentEvent(
       event: com.daml.ledger.api.v2.reassignment.ReassignmentEvent
-  )(using DamlSchema): Task[ReassignmentEvent] = event.event match
+  )(using ProtobufCodecs, DamlSchema): Task[ReassignmentEvent] = event.event match
     case com.daml.ledger.api.v2.reassignment.ReassignmentEvent.Event.Unassigned(evt) =>
       convertUnassignedEvent(evt)
     case com.daml.ledger.api.v2.reassignment.ReassignmentEvent.Event.Assigned(evt) =>
@@ -137,12 +137,14 @@ object specific:
 
   private def convertAssignedEvent(
       evt: com.daml.ledger.api.v2.reassignment.AssignedEvent
-  )(using DamlSchema): Task[Event.Assigned] =
+  )(using ProtobufCodecs, DamlSchema): Task[Event.Assigned] =
     // An AssignedEvent has no offset or node_id of its own: the proto puts them on the embedded
     // created event ("The offset of this event refers to the offset of the assignment, while the
     // node_id is the index of within the batch"). The contract's identity lives there too.
     val created = evt.getCreatedEvent
-    for templateId <- created.getTemplateId.toIdentifier()
+    for
+      templateId <- created.getTemplateId.toIdentifier()
+      payload    <- ZIO.foreach(Option.when(created.createArguments.isDefined)(created))(convertCreatedEvent)
     yield Event.Assigned(
       eventId = EventId(created.offset, created.nodeId),
       reassignmentId = evt.reassignmentId,
@@ -152,7 +154,8 @@ object specific:
       reassignmentCounter = evt.reassignmentCounter,
       contractId = ContractId(created.contractId),
       templateId = templateId,
-      witnesses = created.witnessParties.to(Chunk).map(Party)
+      witnesses = created.witnessParties.to(Chunk).map(Party),
+      created = payload
     )
 
   private def convertExercisedEvent(

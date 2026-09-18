@@ -131,7 +131,8 @@ object specific:
         reassignmentCounter: Long,
         contractId: ContractId,
         templateId: schema.Identifier,
-        witnesses: Chunk[Party]
+        witnesses: Chunk[Party],
+        created: Option[Created] = None
     ) extends ReassignmentEvent
 
   end Event

@@ -236,7 +236,7 @@ declare
     first_offset bigint;
     last_offset  bigint;
 begin
-    select ledger_offset from oldest_checkpoint() into first_offset;
+    select greatest(ledger_offset, pruned_offset()) from oldest_checkpoint() into first_offset;
     select ledger_offset from latest_checkpoint() into last_offset;
     if first_offset is null or p_offset < first_offset then
         raise exception 'offset % is below the retained history', p_offset;
@@ -262,7 +262,7 @@ $$ language sql stable;
 
 create or replace function latest_offset() returns bigint as
 $$
-    select least(nullif(current_setting('pqs.session_offset_latest', true), '')::bigint, ledger_offset)
+    select rel_validate_offset_exists(least(nullif(current_setting('pqs.session_offset_latest', true), '')::bigint, ledger_offset))
     from latest_checkpoint();
 $$ language sql stable parallel safe;
 
@@ -270,8 +270,8 @@ create or replace function oldest_offset() returns bigint as
 $$
     select case
                when coalesce(current_setting('pqs.session_offset_oldest', true), '') = ''
-                   then (select ledger_offset from oldest_checkpoint())
-               else current_setting('pqs.session_offset_oldest', false)::bigint
+                   then (select greatest(ledger_offset, pruned_offset()) from oldest_checkpoint())
+               else rel_validate_offset_exists(current_setting('pqs.session_offset_oldest', false)::bigint)
            end;
 $$ language sql stable parallel safe;
 
@@ -296,12 +296,15 @@ begin
         where event_pk in (select event_pk from __query_events where tx_ix > cutoff_ix);
         delete from __rel_exercises
         where event_pk in (select event_pk from __query_events where tx_ix > cutoff_ix);
+        delete from __rel_reassignments
+        where event_pk in (select event_pk from __query_events where tx_ix > cutoff_ix);
         delete from __query_events where tx_ix > cutoff_ix;
         delete from __rel_contract_visibility
         where contract_pk in (select contract_pk from __rel_contracts where created_tx_ix > cutoff_ix);
         update __rel_contracts set archived_tx_ix = null, archived_at_offset = null where archived_tx_ix > cutoff_ix;
         delete from __rel_contracts where created_tx_ix > cutoff_ix;
         delete from __rel_tmp_lifecycle where archived_tx_ix > cutoff_ix;
+        delete from __rel_pending_visibility where tx_ix > cutoff_ix;
         delete from __rel_transactions where tx_ix > cutoff_ix;
     end if;
 end;

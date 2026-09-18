@@ -52,6 +52,7 @@ object ProductionPool:
         Seq(
           "V001__Create_relational_schema.sql",
           "R__rel_functions.sql",
+          "R__rel_maintenance.sql",
           "R__rel_views_and_triggers.sql"
         )
       ) { name =>

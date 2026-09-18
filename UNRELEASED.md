@@ -18,7 +18,9 @@ This release includes the following SQL migrations:
 
 - Add `postgres-relational` ingestion with retained JSON payloads, selected typed columns and SQL query views.
 - Add projection apply, backfill and activation commands, with managed index planning, build, adoption and retirement.
-- Record ingestion coverage and provenance. HTTP Query API, complete reassignment history, pruning/redaction workflows and document-store migration are not included.
+- Record ingestion coverage and provenance, including assignment and unassignment history within the subscribed interval.
+- Add relational pruning with a dry run and contract/exercise payload redaction. Maintenance requires stopped ingestion; replay guards prevent removed payloads from being restored.
+- HTTP Query API, document-store migration and chunked online pruning are not included.
 
 ### Multi-sync support
 

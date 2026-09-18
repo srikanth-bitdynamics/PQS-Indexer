@@ -194,7 +194,7 @@ object Ledger:
         AssignCommand(reassignmentId, source.id, target.id)
       )
       _ <- submitAndWaitForReassignment(submitter, assignCommand)
-    yield ()
+    yield unassignResp.getReassignment.offset
   }
 
   def recordTransactionStream: ZIO[

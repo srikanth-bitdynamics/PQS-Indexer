@@ -141,15 +141,9 @@ object ProjectionBackfill:
             and entity_name = ${l.entityName} and kind = 'template'"""
       .query[(Long, String)]
       .selectOne
-      .flatMap {
-        case Some(tbl) => ZIO.succeed(tbl)
-        case None =>
-          ZIO.fail(
-            new RuntimeException(
-              s"relational entity ${l.packageName}:${l.moduleName}:${l.entityName} (template) is not initialized; cannot backfill"
-            )
-          )
-      }
+      .someOrFail(
+        new RuntimeException(s"relational entity ${l.qualified} (template) is not initialized; cannot backfill")
+      )
 
   private def initProgress(version: Long, qualified: String, through: Long): ZIO[ZConnection, Throwable, Unit] =
     sql"""insert into __rel_backfill_progress (projection_version, qualified, through_ix)
@@ -176,7 +170,7 @@ object ProjectionBackfill:
       chunkSize: Int
   ): ZIO[ZConnection, Throwable, Unit] =
     selectChunk(entityPk, tbl, through, cursorTx, cursorPk, chunkSize).flatMap { rows =>
-      rows.maxByOption(row => (row._1, row._2)) match
+      rows.lastOption match
         case None => complete(version, qualified)
         case Some(last) =>
           ZIO.foreachDiscard(rows)(row => backfillRow(codec, shape, tbl, row)) *>
@@ -193,16 +187,13 @@ object ProjectionBackfill:
       cursorPk: Long,
       chunkSize: Int
   ): ZIO[ZConnection, Throwable, Seq[(Long, Long, String, String, String, String)]] =
-    (SqlFragment(
-      s"""select c.created_tx_ix, p.contract_pk, pkg.id, pkg.name, pkg.version, p.payload_json::text
-          from ${tbl} p
+    sql"""select c.created_tx_ix, p.contract_pk, pkg.id, pkg.name, pkg.version, p.payload_json::text
+          from ${SqlFragment(tbl)} p
           join __rel_contracts c on c.contract_pk = p.contract_pk
           join __rel_package pkg on pkg.id = c.representative_package_id
-          where c.redaction_id is null and c.template_entity_pk = """
-    ) ++ sql"$entityPk" ++ SqlFragment(" and c.created_tx_ix <= ") ++ sql"$through" ++
-      SqlFragment(" and (c.created_tx_ix, c.contract_pk) > (") ++ sql"$cursorTx" ++
-      SqlFragment(", ") ++ sql"$cursorPk" ++ SqlFragment(") order by c.created_tx_ix, c.contract_pk limit ") ++
-      sql"$chunkSize")
+          where c.redaction_id is null and c.template_entity_pk = $entityPk and c.created_tx_ix <= $through
+            and (c.created_tx_ix, c.contract_pk) > ($cursorTx, $cursorPk)
+          order by c.created_tx_ix, c.contract_pk limit $chunkSize"""
       .query[(Long, Long, String, String, String, String)]
       .selectAll
 
@@ -242,9 +233,9 @@ object ProjectionBackfill:
         val values = shape.promoted.map(_.name).zip(TypedRowCodec.extract(shape, dv))
         val assigns =
           values.map((name, value) => SqlFragment(quoteIdent(name)) ++ sql" = " ++ bind(value)).mkFragment(sql", ")
-        SqlFragment(s"update ${tbl} p set ") ++ assigns ++
-          SqlFragment(" from __rel_contracts c where p.contract_pk = ") ++ sql"$contractPk" ++
-          SqlFragment(" and c.contract_pk = p.contract_pk and c.redaction_id is null")
+        sql"""update ${SqlFragment(tbl)} p set $assigns
+              from __rel_contracts c where p.contract_pk = $contractPk
+                and c.contract_pk = p.contract_pk and c.redaction_id is null"""
       }
       .flatMap(_.update.unit)
 

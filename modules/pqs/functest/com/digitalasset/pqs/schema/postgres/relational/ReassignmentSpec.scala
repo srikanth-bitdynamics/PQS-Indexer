@@ -35,7 +35,9 @@ object ReassignmentSpec extends FuncTest[Service[Ledger] & Postgres & DeployedDa
     lifecycle(false, "TransactionStream"),
     lifecycle(false, "TransactionTreeStream"),
     lifecycle(true, "TransactionStream"),
-    lifecycle(true, "TransactionTreeStream")
+    lifecycle(true, "TransactionTreeStream"),
+    lifecycle(false, "TransactionStream", assignmentFirst = true),
+    lifecycle(false, "TransactionTreeStream", assignmentFirst = true)
   ) @@ onlyCantonVersion(">=3.5")
 
   private def ingest(alice: Party, start: String, datasource: String) =
@@ -46,12 +48,13 @@ object ReassignmentSpec extends FuncTest[Service[Ledger] & Postgres & DeployedDa
       s"--pipeline-filter-parties=${alice.id}"
     )
 
-  private def lifecycle(acs: Boolean, datasource: String) =
+  private def lifecycle(acs: Boolean, datasource: String, assignmentFirst: Boolean = false) =
     funcTest(
-      s"$datasource preserves ${if acs then "ACS-seeded" else "replayed"} state across reassignment and archive"
+      s"$datasource preserves ${if acs then "ACS-seeded" else if assignmentFirst then "assignment-first" else "replayed"} state across reassignment and archive"
     ) {
-      val alice      = Party("Alice")
-      val contractId = Capture[String]
+      val alice            = Party("Alice")
+      val contractId       = Capture[String]
+      val unassignedOffset = Capture[Long]
       Given:
         Postgres.database
       And:
@@ -64,10 +67,14 @@ object ReassignmentSpec extends FuncTest[Service[Ledger] & Postgres & DeployedDa
           .map(_.getTransaction.events.headOption.map(_.getCreated.contractId))
           .someOrFail(new IllegalStateException("create returned no event"))
           .is(contractId.capture)
-      When:
-        Ledger.reassign(contractId.get, alice, source, target)
       And:
-        ingest(alice, if acs then "Latest" else "Genesis", datasource)
+        Ledger.reassign(contractId.get, alice, source, target).is(unassignedOffset.capture)
+      And:
+        ingest(
+          alice,
+          if acs then "Latest" else if assignmentFirst then unassignedOffset.get.toString else "Genesis",
+          datasource
+        )
       Then:
         Postgres.query {
           for
@@ -86,10 +93,16 @@ object ReassignmentSpec extends FuncTest[Service[Ledger] & Postgres & DeployedDa
               .query[(Boolean, Boolean, Boolean)]
               .selectAll
           yield assertTrue(
-            lifecycle == Seq((if acs then "acs_seed" else "stream", acs, true)),
+            lifecycle == Seq(
+              (
+                if acs then "acs_seed" else if assignmentFirst then "assignment" else "stream",
+                acs || assignmentFirst,
+                true
+              )
+            ),
             active.contains(1L),
-            events.contains((1L, 0L)),
-            coverage == Seq((false, false, acs))
+            events.contains((if acs || assignmentFirst then 1L else 3L, 0L)),
+            coverage == Seq((true, true, acs || assignmentFirst))
           )
         }
       When:

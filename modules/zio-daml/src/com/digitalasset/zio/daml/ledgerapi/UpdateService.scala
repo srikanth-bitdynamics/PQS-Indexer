@@ -136,7 +136,7 @@ case class UpdateService(
                       ZIO.foreach(tx.events.to(Chunk))(convertEvent(_)(using codecs, identifiers))
                   case adapter: ReassignmentAdapter =>
                     process(adapter, updateSpan, seenAt): rs =>
-                      ZIO.foreach(rs.events.to(Chunk))(convertReassignmentEvent(_)(using identifiers))
+                      ZIO.foreach(rs.events.to(Chunk))(convertReassignmentEvent(_)(using codecs, identifiers))
               }
             }
       )

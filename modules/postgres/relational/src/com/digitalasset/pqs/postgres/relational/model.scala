@@ -23,6 +23,7 @@ object model {
     case ContractVisibility extends Table("__rel_contract_visibility")
     case Exercises          extends Table("__rel_exercises")
     case TmpLifecycle       extends Table("__rel_tmp_lifecycle")
+    case Reassignments      extends Table("__rel_reassignments")
     // per-template payload tables are named dynamically; these cases carry only the metrics label
     case ContractPayload extends Table("rel_contract_payload")
     case InterfaceView   extends Table("relv_interface_view")
@@ -39,7 +40,7 @@ object model {
     val ix: Long                 = tx.ix
     val offset: Offset           = tx.offset
 
-  final class Event(ev: specific.Event) extends Copy:
+  final class Event(val ev: specific.Event) extends Copy:
     val _table = Table.Events
     val _sql   = s"/*1*/ copy ${_table.name} (${ev.columns.mkString(", ")}) from stdin"
     val _row   = ev.rowValues
@@ -51,13 +52,13 @@ object model {
     val _row   = ev.rowValues
     val labels = Set.empty
 
-  final class Contract(ev: specific.Contract) extends Copy:
+  final class Contract(val ev: specific.Contract) extends Copy:
     val _table                   = Table.Contracts
     val _sql                     = s"/*3*/ copy ${_table.name} (${ev.columns.mkString(", ")}) from stdin"
     val _row                     = ev.rowValues
     val labels: Set[MetricLabel] = l("type" -> "create")
 
-  final class ContractVisibility(ev: specific.ContractVisibility) extends Copy:
+  final class ContractVisibility(val ev: specific.ContractVisibility) extends Copy:
     val _table = Table.ContractVisibility
     val _sql   = s"/*4*/ copy ${_table.name} (${ev.columns.mkString(", ")}) from stdin"
     val _row   = ev.rowValues
@@ -75,15 +76,21 @@ object model {
     val _row                     = ev.rowValues
     val labels: Set[MetricLabel] = l("type" -> "archive")
 
-  final class ContractPayload(ev: specific.ContractPayload, tableName: String) extends Copy:
+  final class ContractPayload(val ev: specific.ContractPayload, tableName: String) extends Copy:
     val _table                   = Table.ContractPayload
     val _sql                     = s"/*7*/ copy $tableName (${ev.columns.mkString(", ")}) from stdin"
     val _row                     = ev.rowValues
     val labels: Set[MetricLabel] = l("type" -> "payload")
 
-  final class InterfaceView(ev: specific.InterfaceView, tableName: String) extends Copy:
+  final class InterfaceView(val ev: specific.InterfaceView, tableName: String) extends Copy:
     val _table = Table.InterfaceView
     val _sql   = s"/*8*/ copy $tableName (${ev.columns.mkString(", ")}) from stdin"
+    val _row   = ev.rowValues
+    val labels = Set.empty
+
+  final class Reassignment(ev: specific.Reassignment) extends Copy:
+    val _table = Table.Reassignments
+    val _sql   = s"/*9*/ copy ${_table.name} (${ev.columns.mkString(", ")}) from stdin"
     val _row   = ev.rowValues
     val labels = Set.empty
 
@@ -91,15 +98,18 @@ object model {
   given choiceNameConverter: ValueConverter[ChoiceName] = value => escape(value.toString)
 
   enum EventKind:
-    case Create; case Exercise; case Archive
+    case Create; case Exercise; case Archive; case Assign; case Unassign
   given eventKindConverter: ValueConverter[EventKind] =
     case EventKind.Create   => "create"
     case EventKind.Exercise => "exercise"
     case EventKind.Archive  => "archive"
+    case EventKind.Assign   => "assign"
+    case EventKind.Unassign => "unassign"
 
   enum SourceKind:
-    case Stream; case AcsSeed; case LedgerReplay; case DocumentBackfill
+    case Stream; case AcsSeed; case LedgerReplay; case DocumentBackfill; case Assignment
   given sourceKindConverter: ValueConverter[SourceKind] =
+    case SourceKind.Assignment       => "assignment"
     case SourceKind.Stream           => "stream"
     case SourceKind.AcsSeed          => "acs_seed"
     case SourceKind.LedgerReplay     => "ledger_replay"

@@ -11,20 +11,17 @@ import com.digitalasset.pqs.o11y.metrics.latency
 import com.digitalasset.pqs.o11y.traces
 import com.digitalasset.pqs.o11y.traces.given
 import com.digitalasset.pqs.postgres.backend.*
-import com.digitalasset.pqs.postgres.backend.{transact as transaction}
+import com.digitalasset.pqs.postgres.backend.{copy as writer, transact as transaction}
 import com.digitalasset.pqs.postgres.relational.projection.{ProjectionBinding, Shape, TypedRowCodec}
 import com.digitalasset.transcode.Codec
 import com.digitalasset.transcode.schema.{ChoiceName, Dictionary, DynamicValue, Identifier}
 import ujson.Value
 import zio.ZIO.{logDebug, logInfo}
 import zio.jdbc.*
-import zio.metrics.Metric
-import zio.metrics.MetricKeyType.Histogram.Boundaries
 import zio.stream.{ZChannel, ZPipeline, ZSink}
 import com.digitalasset.zio.daml.DamlSchema
-import zio.{Chunk, ChunkBuilder, Schedule, ZEnvironment, ZIO, ZLayer, durationInt}
+import zio.{Chunk, ZEnvironment, ZIO, ZLayer}
 
-import scala.collection.mutable
 import scala.language.implicitConversions
 
 final case class RelationalPostgres(
@@ -52,10 +49,8 @@ final case class RelationalPostgres(
   private val env                           = ZEnvironment(pool) ++ ZEnvironment(config) ++ ZEnvironment(poolConfig)
   private def tx[A](effect: ZIO[ZConnection, Throwable, A]): ZIO[Any, Throwable, A] =
     transaction(WriterFence.check(fenceIdentity) *> effect).provideEnvironment(env)
-  private val BatchEntitiesThreshold = 10_000
-  private val BatchReleaseWindow     = 200.millis
-  private val ReservedConnections    = 1
-  private val IngestParallelism      = math.max(1, poolConfig.maxConnections - ReservedConnections)
+  private val ReservedConnections = 1
+  private val IngestParallelism   = math.max(1, poolConfig.maxConnections - ReservedConnections)
 
   override def registerActiveWriterAndCleanupTransactions = tx(
     sql"call __rel_cleanup_transactions_after_watermark()".execute
@@ -90,21 +85,21 @@ final case class RelationalPostgres(
                 ${record.actualStart.toSqlValue}, ${Option.empty[Long]},
                 (select ledger_offset from __rel_transactions where tx_ix = 0),
                 $allParties, ${parties}::text[], ${record.contractFilter}, ${record.metadataFilter}, $treeStream,
-                true, $treeStream, true, true, false, false, now(), null)""".update.unit
+                true, $treeStream, true, true, true, true, now(), null)""".update.unit
     )
 
   override def processAcs = (
     waitPoint("pipeline_wp_acs_events", poolConfig.bufferSize, 1024 min poolConfig.bufferSize)
       >>> convertAcsEventsToStatements
       >>> waitPoint("pipeline_wp_acs_statements", poolConfig.bufferSize, 1024 min poolConfig.bufferSize)
-      >>> batchStatements
+      >>> writer.batchStatements
       >>> waitPoint("pipeline_wp_acs_batched_statements")
       >>> prepareStatements
       >>> waitPoint("pipeline_wp_acs_prepared_statements")
       >>> executePar(IngestParallelism)
       >>> ZPipeline.flattenChunks
       >>> updateAcsOffsets
-      >>> handleWatermarks
+      >>> writer.handleWatermarks(updateWatermark)
       >>> ZSink.drain
   ).provideEnvironment(env)
 
@@ -112,14 +107,14 @@ final case class RelationalPostgres(
     waitPoint("pipeline_wp_events", poolConfig.bufferSize, 1024 min poolConfig.bufferSize)
       >>> convertTransactionEventsToStatements(8)
       >>> waitPoint("pipeline_wp_statements", poolConfig.bufferSize, 1024 min poolConfig.bufferSize)
-      >>> batchStatements
+      >>> writer.batchStatements
       >>> waitPoint("pipeline_wp_batched_statements")
       >>> prepareStatements
       >>> waitPoint("pipeline_wp_prepared_statements")
       >>> executeParUnordered(IngestParallelism)
       >>> waitPoint("pipeline_wp_watermarks", 1024)
-      >>> reorderCheckpoints
-      >>> handleWatermarks
+      >>> writer.reorderCheckpoints(getLastCheckpoint.map(cp => model.Watermark(cp._2, cp._1, Seq.empty)))
+      >>> writer.handleWatermarks(updateWatermark)
       >>> ZSink.drain
   ).provideEnvironment(env)
 
@@ -172,27 +167,6 @@ final case class RelationalPostgres(
       )
       .tap(x => logDebug(s"Converted ${x.length} transaction events to SQL fragments"))
 
-  private def batchStatements =
-    ZPipeline[Chunk[model.Model]]
-      .aggregateAsyncWithin(
-        ZSink.foldChunks(
-          ChunkBuilder.make[model.Model]() -> 0
-        ) { (acc, size) =>
-          size < BatchEntitiesThreshold
-        } {
-          case ((acc, size), in) =>
-            var s = size
-            for chunk <- in; elem <- chunk do { acc.addOne(elem); s += 1 }
-            (acc, s)
-        },
-        Schedule.spaced(BatchReleaseWindow)
-      )
-      .map(_._1.result())
-      .tap { models =>
-        ZIO.foreachDiscard(models.onlyTransactions())(_.ifTraced(_.addEvent("released transaction model into batch")))
-      }
-      .tap(x => logDebug(s"Aggregated ${x.length} SQL fragments into single batch"))
-
   private def prepareStatements =
     val trackPrepare = latency("pipeline_prepare_batch_latency", "Latency of preparing batches of statements")
     val trackExecute = latency("pipeline_execute_batch_latency", "Latency of executing batches of statements")
@@ -201,7 +175,13 @@ final case class RelationalPostgres(
         val onlyTxs = models.onlyTransactions()
         ZIO.attempt {
           traces.span("execute batch") {
-            (WriterFence.check(fenceIdentity) *> model.Model.prepareStatement(models, model.statTables))
+            (WriterFence.check(fenceIdentity) *> ContractObservations
+              .prepare(models)
+              .flatMap(normalized =>
+                model.Model
+                  .prepareStatement(normalized, model.statTables)
+                  .tap(_ => ContractObservations.finish(models))
+              ))
               @@ trackExecute
               @@ traces.attributes("pqs.batch.models_count" -> models.length.toLong)
               <* ZIO.foreachDiscard(onlyTxs) { tx =>
@@ -216,78 +196,6 @@ final case class RelationalPostgres(
         } <* ZIO.foreachDiscard(onlyTxs)(_.ifTraced(_.addEvent("prepared SQL statements for transaction model")))
       } @@ trackPrepare
     }
-
-  private def reorderCheckpoints =
-    type AccumulatorChannel =
-      ZChannel[Any, Nothing, Chunk[Chunk[model.Watermark]], Any, Nothing, Chunk[model.Watermark], Unit]
-    def accumulator(state: mutable.ArrayBuffer[model.Watermark]): AccumulatorChannel = ZChannel.readWithCause(
-      in => {
-        for chunk <- in do state.addAll(chunk)
-        state.sortInPlace()
-        val consecutive = (state.view zip state.view.drop(1)).takeWhile { (prev, next) => prev.ix + 1 == next.ix }
-        consecutive.lastOption match
-          case Some((_, value)) =>
-            val advancing = state.view.slice(1, consecutive.size + 1)
-            val seenAts   = advancing.map(_.seenAts).fold(Seq.empty)(_ ++ _)
-            val txs       = advancing.map(_.txSpans).fold(Seq.empty)(_ ++ _)
-            val batches   = advancing.map(_.persistSpans).fold(Seq.empty)(_ ++ _).distinct
-            state.remove(0, consecutive.size)
-            val effectiveWatermark = value.copy(seenAts = seenAts, txSpans = txs, persistSpans = batches)
-            ZChannel.write(Chunk(effectiveWatermark)) *> accumulator(state)
-          case None =>
-            accumulator(state)
-      },
-      err => ZChannel.refailCause(err),
-      _ => ZChannel.unit
-    )
-    ZPipeline.unwrap(
-      getLastCheckpoint
-        .map(cp => model.Watermark(cp._2, cp._1, Seq.empty))
-        .map(start =>
-          ZPipeline.fromChannel[Any, Nothing, Chunk[model.Watermark], model.Watermark](
-            accumulator(mutable.ArrayBuffer(start))
-          )
-        )
-    )
-
-  private def handleWatermarks =
-    val trackWatermark = latency("pipeline_progress_watermark", "Latency of watermark progression")
-    val watermarkIx = Metric
-      .gauge("watermark_ix", "Current watermark index (transaction ordinal number for consistent reads)")
-      .contramap[Long](_.toDouble)
-    val txProcessingLatency = Metric
-      .histogram(
-        "total_tx_handling_latency",
-        "Total transaction handling latency in pqs",
-        Boundaries.exponential(0.001, math.pow(10, 1.0 / 3), 13)
-      )
-      .contramap[Long](_.toDouble / 1e9)
-    ZPipeline[model.Watermark].mapZIO(wm =>
-      traces.span("advance datastore watermark") {
-        trackWatermark(updateWatermark(wm))
-          @@ traces.attributes(
-            "pqs.watermark.offset" -> wm.offset.toSqlValue,
-            "pqs.watermark.ix"     -> wm.ix
-          )
-          *> ZIO.foreachDiscard(wm.txSpans) { s =>
-            s.linkToCurrentSpan("target" -> "↧ advance watermark")
-              *> s.addEvent(
-                "advanced datastore watermark",
-                "offset" -> wm.offset.toSqlValue,
-                "index"  -> wm.ix
-              )
-              *> s.end()
-          }
-          *> ZIO.foreachDiscard(wm.persistSpans) { s =>
-            ZIO.unit @@ traces.link(s, "target" -> "↥ persist to datastore")
-          }
-          *> zio.Clock.nanoTime.flatMap(now =>
-            ZIO.foreachDiscard(wm.seenAts) { seenAt => txProcessingLatency.update(now - seenAt) }
-          )
-          *> watermarkIx.update(wm.ix)
-          *> logInfo(s"Advanced watermark: ix = ${wm.ix}, offset = ${wm.offset.toSqlValue}")
-      }
-    )
 
   private def updateWatermark(wm: model.Watermark) =
     tx(sql"update __rel_watermark set ledger_offset = ${wm.offset.toSqlValue}, tx_ix = ${wm.ix}".update)
@@ -359,8 +267,8 @@ final case class RelationalPostgres(
           // the contract reuses its create event's pk, so a create allocates one id, not two
           val contractPk = eventPk
           val historyLowerBound = sourceKind match
-            case model.SourceKind.AcsSeed => true
-            case _                        => false
+            case model.SourceKind.AcsSeed | model.SourceKind.Assignment => true
+            case _                                                      => false
           val contract = model.Contract(
             specific.Contract(
               contractPk = contractPk,
@@ -370,8 +278,8 @@ final case class RelationalPostgres(
               creationPackageId = c.creationPackageId,
               createdAtIx = txIx,
               createdAtOffset = sourceKind match
-                case model.SourceKind.AcsSeed => None
-                case _                        => Some(c.eventId._1),
+                case model.SourceKind.AcsSeed | model.SourceKind.Assignment => None
+                case _                                                      => Some(c.eventId._1),
               signatories = c.signatories,
               observers = c.observers,
               createWitnesses = c.witnesses,
@@ -450,8 +358,50 @@ final case class RelationalPostgres(
           exercise
         ) ++ eventVisibility(e.witnesses) ++ lifecycle
 
-      case _: ReassignmentEvent =>
-        Chunk.empty
+      case a: canonical.specific.Event.Assigned =>
+        val created = a.created.getOrElse(
+          throw new IllegalArgumentException(
+            s"assignment ${a.reassignmentId} has no template payload for ${a.contractId}"
+          )
+        )
+        val rows = insertEvent(txIx, model.SourceKind.Assignment, None, created.copy(acsDelta = true))
+        val assigned = rows
+          .collectFirst { case e: model.Event => e.ev }
+          .getOrElse(
+            throw new IllegalArgumentException(
+              s"assignment ${a.reassignmentId} has no known template for ${a.contractId}"
+            )
+          )
+        rows.map {
+          case _: model.Event => model.Event(assigned.copy(eventKind = model.EventKind.Assign, sourceKind = sourceKind))
+          case other          => other
+        } :+ model.Reassignment(
+          specific.Reassignment(
+            assigned.pk,
+            a.reassignmentId,
+            a.source,
+            a.target,
+            a.submitter,
+            a.reassignmentCounter,
+            None
+          )
+        )
+
+      case u: canonical.specific.Event.Unassigned =>
+        Chunk(
+          eventRow(u.eventId, u.contractId, getEntityPk(u.templateId), model.EventKind.Unassign, None),
+          model.Reassignment(
+            specific.Reassignment(
+              eventPk,
+              u.reassignmentId,
+              u.source,
+              u.target,
+              u.submitter,
+              u.reassignmentCounter,
+              u.assignmentExclusivity
+            )
+          )
+        ) ++ eventVisibility(u.witnesses)
   }
 end RelationalPostgres
 

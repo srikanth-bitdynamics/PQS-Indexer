@@ -66,7 +66,9 @@ CREATE TYPE pqs_relational.rel_entity_kind AS ENUM (
 CREATE TYPE pqs_relational.rel_event_kind AS ENUM (
     'create',
     'exercise',
-    'archive'
+    'archive',
+    'assign',
+    'unassign'
 );
 
 
@@ -102,7 +104,8 @@ CREATE TYPE pqs_relational.rel_source_kind AS ENUM (
     'stream',
     'acs_seed',
     'ledger_replay',
-    'document_backfill'
+    'document_backfill',
+    'assignment'
 );
 
 
@@ -115,6 +118,23 @@ CREATE TYPE pqs_relational.rel_visibility_role AS ENUM (
     'observer',
     'witness'
 );
+
+
+--
+-- Name: __rel_begin_maintenance(); Type: PROCEDURE; Schema: pqs_relational; Owner: -
+--
+
+CREATE PROCEDURE pqs_relational.__rel_begin_maintenance()
+    LANGUAGE plpgsql
+    AS $$
+begin
+    perform pg_advisory_xact_lock(('x70716a5f70726f6a'::bit(64))::bigint);
+    if not pg_try_advisory_xact_lock(('x70716a5f7772746c'::bit(64))::bigint) then
+        raise exception 'stop the relational writer before pruning or redaction';
+    end if;
+    perform pg_advisory_xact_lock(('x70716a5f61637476'::bit(64))::bigint);
+end;
+$$;
 
 
 --
@@ -161,12 +181,15 @@ begin
         where event_pk in (select event_pk from __query_events where tx_ix > cutoff_ix);
         delete from __rel_exercises
         where event_pk in (select event_pk from __query_events where tx_ix > cutoff_ix);
+        delete from __rel_reassignments
+        where event_pk in (select event_pk from __query_events where tx_ix > cutoff_ix);
         delete from __query_events where tx_ix > cutoff_ix;
         delete from __rel_contract_visibility
         where contract_pk in (select contract_pk from __rel_contracts where created_tx_ix > cutoff_ix);
         update __rel_contracts set archived_tx_ix = null, archived_at_offset = null where archived_tx_ix > cutoff_ix;
         delete from __rel_contracts where created_tx_ix > cutoff_ix;
         delete from __rel_tmp_lifecycle where archived_tx_ix > cutoff_ix;
+        delete from __rel_pending_visibility where tx_ix > cutoff_ix;
         delete from __rel_transactions where tx_ix > cutoff_ix;
     end if;
 end;
@@ -388,6 +411,88 @@ $$;
 
 
 --
+-- Name: __rel_prune(bigint, boolean); Type: FUNCTION; Schema: pqs_relational; Owner: -
+--
+
+CREATE FUNCTION pqs_relational.__rel_prune(p_offset bigint, p_dry_run boolean) RETURNS TABLE(pruning_boundary_offset bigint, deleted_contracts bigint, deleted_exercises bigint, deleted_events bigint, deleted_transactions bigint)
+    LANGUAGE plpgsql
+    AS $$
+declare
+    cutoff bigint;
+    watermark rel_checkpoint;
+begin
+    call __rel_begin_maintenance();
+    select * into watermark from latest_checkpoint();
+    if p_offset is null or p_offset < 0 or watermark.ledger_offset is null or p_offset > watermark.ledger_offset then
+        raise exception 'pruning offset must be within published history';
+    end if;
+    if p_offset <= coalesce(pruned_offset(), -1) then
+        return query select null::bigint, 0::bigint, 0::bigint, 0::bigint, 0::bigint;
+        return;
+    end if;
+    select max(tx_ix) into cutoff from __rel_transactions where ledger_offset <= p_offset;
+    if cutoff is null then
+        return query select null::bigint, 0::bigint, 0::bigint, 0::bigint, 0::bigint;
+        return;
+    end if;
+
+    with removed_contracts as (
+        select contract_pk from __rel_contracts where archived_tx_ix <= cutoff and created_tx_ix <= cutoff
+    ), kept_contracts as (
+        select * from __rel_contracts where contract_pk not in (select contract_pk from removed_contracts)
+    ), removed_events as (
+        select e.event_pk from __query_events e where e.tx_ix <= cutoff
+          and not exists (select 1 from kept_contracts c where c.contract_id = e.contract_id
+                          and (e.event_kind = 'create' or c.contract_pk = e.event_pk))
+    )
+    select (select count(*) from removed_contracts),
+           (select count(*) from __rel_exercises where event_pk in (select event_pk from removed_events)),
+           (select count(*) from removed_events),
+           (select count(*) from __rel_transactions t where t.tx_ix < cutoff and t.tx_ix <> watermark.tx_ix
+              and not exists (select 1 from kept_contracts c where c.created_tx_ix = t.tx_ix or c.archived_tx_ix = t.tx_ix)
+              and not exists (select 1 from __query_events e where e.tx_ix = t.tx_ix
+                              and e.event_pk not in (select event_pk from removed_events)))
+    into deleted_contracts, deleted_exercises, deleted_events, deleted_transactions;
+
+    if not p_dry_run then
+        insert into __rel_contract_tombstone(contract_id)
+        select contract_id from __rel_contracts where archived_tx_ix <= cutoff and created_tx_ix <= cutoff
+        union select contract_id from __rel_tmp_lifecycle where archived_tx_ix <= cutoff
+        on conflict do nothing;
+        delete from __rel_contract_visibility where contract_pk in (
+            select contract_pk from __rel_contracts where archived_tx_ix <= cutoff and created_tx_ix <= cutoff);
+        delete from __rel_contracts where archived_tx_ix <= cutoff and created_tx_ix <= cutoff;
+        delete from __query_event_visibility where event_pk in (
+            select e.event_pk from __query_events e where e.tx_ix <= cutoff
+            and not exists (select 1 from __rel_contracts c where c.contract_id = e.contract_id
+                            and (e.event_kind = 'create' or c.contract_pk = e.event_pk)));
+        delete from __rel_exercises where event_pk in (
+            select e.event_pk from __query_events e where e.tx_ix <= cutoff
+            and not exists (select 1 from __rel_contracts c where c.contract_id = e.contract_id
+                            and (e.event_kind = 'create' or c.contract_pk = e.event_pk)));
+        delete from __rel_reassignments where event_pk in (
+            select e.event_pk from __query_events e where e.tx_ix <= cutoff
+            and not exists (select 1 from __rel_contracts c where c.contract_id = e.contract_id
+                            and (e.event_kind = 'create' or c.contract_pk = e.event_pk)));
+        delete from __query_events e where e.tx_ix <= cutoff
+            and not exists (select 1 from __rel_contracts c where c.contract_id = e.contract_id
+                            and (e.event_kind = 'create' or c.contract_pk = e.event_pk));
+        delete from __rel_tmp_lifecycle where archived_tx_ix <= cutoff;
+        delete from __rel_transactions t where t.tx_ix < cutoff and t.tx_ix <> watermark.tx_ix
+            and not exists (select 1 from __rel_contracts c where c.created_tx_ix = t.tx_ix or c.archived_tx_ix = t.tx_ix)
+            and not exists (select 1 from __query_events e where e.tx_ix = t.tx_ix);
+        update __rel_pruning_metadata set pruned_offset = p_offset;
+        update __query_coverage set create_history_complete = false, exercise_history_complete = false,
+            archive_history_complete = false, archive_visibility_complete = false,
+            reassignment_history_complete = false, assignment_origin_state_complete = false
+        where actual_from_offset <= p_offset;
+    end if;
+    return query select p_offset, deleted_contracts, deleted_exercises, deleted_events, deleted_transactions;
+end;
+$$;
+
+
+--
 -- Name: __rel_typed_table_name(text, text, text, pqs_relational.rel_entity_kind); Type: FUNCTION; Schema: pqs_relational; Owner: -
 --
 
@@ -437,14 +542,27 @@ begin
         raise exception '__rel_watermark.tx_ix and __rel_watermark.ledger_offset must not be null';
     end if;
 
-    with drained as (
-        delete from __rel_tmp_lifecycle where archived_tx_ix <= new.tx_ix
-            returning contract_id, archived_tx_ix, archived_at_offset)
+    -- Keep archives whose create/assignment has not arrived yet; streams across synchronizers can be non-causal.
     update __rel_contracts c
-    set archived_tx_ix     = d.archived_tx_ix,
-        archived_at_offset = d.archived_at_offset
-    from drained d
-    where c.contract_id = d.contract_id and c.archived_tx_ix is null;
+    set archived_tx_ix = d.archived_tx_ix, archived_at_offset = d.archived_at_offset
+    from (
+        select distinct on (contract_id) contract_id, archived_tx_ix, archived_at_offset
+        from __rel_tmp_lifecycle where archived_tx_ix <= new.tx_ix
+        order by contract_id, archived_tx_ix
+    ) d
+    where c.contract_id = d.contract_id and c.created_tx_ix <= new.tx_ix
+      and (c.archived_tx_ix is null or d.archived_tx_ix < c.archived_tx_ix);
+
+    delete from __rel_tmp_lifecycle d
+    using __rel_contracts c
+    where c.contract_id = d.contract_id and c.created_tx_ix <= new.tx_ix and d.archived_tx_ix <= new.tx_ix;
+
+    insert into __rel_contract_visibility(contract_pk, party, role)
+    select c.contract_pk, v.party, v.role from __rel_pending_visibility v
+    join __rel_contracts c using (contract_id)
+    where v.tx_ix <= new.tx_ix and c.created_tx_ix <= new.tx_ix and c.redaction_id is null
+    on conflict do nothing;
+    delete from __rel_pending_visibility where tx_ix <= new.tx_ix;
 
     update __query_coverage
     set through_offset = new.ledger_offset
@@ -484,7 +602,7 @@ $$;
 CREATE FUNCTION pqs_relational.latest_offset() RETURNS bigint
     LANGUAGE sql STABLE PARALLEL SAFE
     AS $$
-    select least(nullif(current_setting('pqs.session_offset_latest', true), '')::bigint, ledger_offset)
+    select rel_validate_offset_exists(least(nullif(current_setting('pqs.session_offset_latest', true), '')::bigint, ledger_offset))
     from latest_checkpoint();
 $$;
 
@@ -520,10 +638,28 @@ CREATE FUNCTION pqs_relational.oldest_offset() RETURNS bigint
     AS $$
     select case
                when coalesce(current_setting('pqs.session_offset_oldest', true), '') = ''
-                   then (select ledger_offset from oldest_checkpoint())
-               else current_setting('pqs.session_offset_oldest', false)::bigint
+                   then (select greatest(ledger_offset, pruned_offset()) from oldest_checkpoint())
+               else rel_validate_offset_exists(current_setting('pqs.session_offset_oldest', false)::bigint)
            end;
 $$;
+
+
+--
+-- Name: prune_archived_to_offset(bigint); Type: FUNCTION; Schema: pqs_relational; Owner: -
+--
+
+CREATE FUNCTION pqs_relational.prune_archived_to_offset(p_offset bigint) RETURNS TABLE(pruning_boundary_offset bigint, deleted_contracts bigint, deleted_exercises bigint, deleted_events bigint, deleted_transactions bigint)
+    LANGUAGE sql
+    AS $$ select * from __rel_prune(p_offset, false); $$;
+
+
+--
+-- Name: prune_archived_to_offset_dry_run(bigint); Type: FUNCTION; Schema: pqs_relational; Owner: -
+--
+
+CREATE FUNCTION pqs_relational.prune_archived_to_offset_dry_run(p_offset bigint) RETURNS TABLE(pruning_boundary_offset bigint, deleted_contracts bigint, deleted_exercises bigint, deleted_events bigint, deleted_transactions bigint)
+    LANGUAGE sql
+    AS $$ select * from __rel_prune(p_offset, true); $$;
 
 
 --
@@ -538,6 +674,90 @@ $$;
 
 
 --
+-- Name: redact_contract(text, text); Type: FUNCTION; Schema: pqs_relational; Owner: -
+--
+
+CREATE FUNCTION pqs_relational.redact_contract(p_contract_id text, p_redaction_id text) RETURNS bigint
+    LANGUAGE plpgsql
+    AS $_$
+declare
+    c __rel_contracts%rowtype;
+    entity record;
+    boundary bigint;
+begin
+    call __rel_begin_maintenance();
+    if p_redaction_id is null or btrim(p_redaction_id) = '' then
+        raise exception 'redaction id must not be empty';
+    end if;
+    select * into c from __rel_contracts where contract_id = p_contract_id for update;
+    if not found then
+        if exists (select 1 from __rel_redaction where contract_id = p_contract_id and redaction_id = p_redaction_id) then
+            return 0;
+        end if;
+        raise exception 'cannot find contract %', p_contract_id;
+    end if;
+    if c.redaction_id = p_redaction_id then return 0; end if;
+    if c.redaction_id is not null then raise exception 'contract % is already redacted', p_contract_id; end if;
+    select tx_ix into boundary from latest_checkpoint();
+    if boundary is null or c.created_tx_ix > boundary or c.archived_tx_ix is null or c.archived_tx_ix > boundary then
+        raise exception 'contract % must be archived through the published watermark', p_contract_id;
+    end if;
+
+    -- Removing the entire payload row also removes every promoted value and its index entries.
+    for entity in select base_table from __rel_entity
+                  where pk = c.template_entity_pk or pk in (
+                      select interface_pk from __rel_implements where template_pk = c.template_entity_pk)
+    loop
+        execute format('delete from %I where contract_pk = $1', entity.base_table) using c.contract_pk;
+    end loop;
+    update __rel_contracts set contract_key_json = null, contract_key_hash = null,
+        metadata = null, redaction_id = p_redaction_id where contract_pk = c.contract_pk;
+    update __rel_exercises x set argument_json = null, result_json = null, redaction_id = p_redaction_id
+    from __query_events e where e.event_pk = x.event_pk and e.contract_id = p_contract_id
+      and x.redaction_id is null;
+    insert into __rel_redaction(contract_id, redaction_id, redacted_at)
+    values (p_contract_id, p_redaction_id, now());
+    return 1;
+end;
+$_$;
+
+
+--
+-- Name: redact_exercise(bigint, integer, text); Type: FUNCTION; Schema: pqs_relational; Owner: -
+--
+
+CREATE FUNCTION pqs_relational.redact_exercise(p_offset bigint, p_node integer, p_redaction_id text) RETURNS bigint
+    LANGUAGE plpgsql
+    AS $$
+declare
+    event_id bigint;
+    previous text;
+begin
+    call __rel_begin_maintenance();
+    if p_redaction_id is null or btrim(p_redaction_id) = '' then
+        raise exception 'redaction id must not be empty';
+    end if;
+    select x.event_pk, x.redaction_id into event_id, previous
+    from __rel_exercises x join __query_events e using (event_pk)
+    where e.ledger_offset = p_offset and e.node_id = p_node
+      and e.tx_ix <= (select tx_ix from latest_checkpoint()) for update of x;
+    if not found then
+        if exists (select 1 from __rel_redaction where event_id_offset = p_offset
+                   and event_id_node = p_node and redaction_id = p_redaction_id) then return 0; end if;
+        raise exception 'cannot find published exercise (%, %)', p_offset, p_node;
+    end if;
+    if previous = p_redaction_id then return 0; end if;
+    if previous is not null then raise exception 'exercise (%, %) is already redacted', p_offset, p_node; end if;
+    update __rel_exercises set argument_json = null, result_json = null, redaction_id = p_redaction_id
+    where event_pk = event_id;
+    insert into __rel_redaction(event_id_offset, event_id_node, redaction_id, redacted_at)
+    values (p_offset, p_node, p_redaction_id, now());
+    return 1;
+end;
+$$;
+
+
+--
 -- Name: rel_validate_offset_exists(bigint); Type: FUNCTION; Schema: pqs_relational; Owner: -
 --
 
@@ -548,7 +768,7 @@ declare
     first_offset bigint;
     last_offset  bigint;
 begin
-    select ledger_offset from oldest_checkpoint() into first_offset;
+    select greatest(ledger_offset, pruned_offset()) from oldest_checkpoint() into first_offset;
     select ledger_offset from latest_checkpoint() into last_offset;
     if first_offset is null or p_offset < first_offset then
         raise exception 'offset % is below the retained history', p_offset;
@@ -728,6 +948,15 @@ ALTER SEQUENCE pqs_relational.__rel_choice_pk_seq OWNED BY pqs_relational.__rel_
 
 
 --
+-- Name: __rel_contract_tombstone; Type: TABLE; Schema: pqs_relational; Owner: -
+--
+
+CREATE TABLE pqs_relational.__rel_contract_tombstone (
+    contract_id text NOT NULL
+);
+
+
+--
 -- Name: __rel_contract_visibility; Type: TABLE; Schema: pqs_relational; Owner: -
 --
 
@@ -752,7 +981,11 @@ CREATE TABLE pqs_relational.__rel_contracts (
     archived_tx_ix bigint,
     created_at_offset bigint,
     archived_at_offset bigint,
-    life_ix int8range GENERATED ALWAYS AS (int8range(created_tx_ix, archived_tx_ix, '[)'::text)) STORED,
+    life_ix int8range GENERATED ALWAYS AS (
+CASE
+    WHEN (archived_tx_ix < created_tx_ix) THEN 'empty'::int8range
+    ELSE int8range(created_tx_ix, archived_tx_ix, '[)'::text)
+END) STORED,
     signatories text[] DEFAULT '{}'::text[] NOT NULL,
     observers text[] DEFAULT '{}'::text[] NOT NULL,
     create_witnesses text[] DEFAULT '{}'::text[] NOT NULL,
@@ -914,6 +1147,18 @@ ALTER SEQUENCE pqs_relational.__rel_package_pk_seq OWNED BY pqs_relational.__rel
 
 
 --
+-- Name: __rel_pending_visibility; Type: TABLE; Schema: pqs_relational; Owner: -
+--
+
+CREATE TABLE pqs_relational.__rel_pending_visibility (
+    contract_id text NOT NULL,
+    party text NOT NULL,
+    role pqs_relational.rel_visibility_role NOT NULL,
+    tx_ix bigint NOT NULL
+);
+
+
+--
 -- Name: __rel_pruning_metadata; Type: TABLE; Schema: pqs_relational; Owner: -
 --
 
@@ -921,6 +1166,21 @@ CREATE TABLE pqs_relational.__rel_pruning_metadata (
     singleton boolean DEFAULT true NOT NULL,
     pruned_offset bigint,
     CONSTRAINT __rel_pruning_metadata_singleton_check CHECK (singleton)
+);
+
+
+--
+-- Name: __rel_reassignments; Type: TABLE; Schema: pqs_relational; Owner: -
+--
+
+CREATE TABLE pqs_relational.__rel_reassignments (
+    event_pk bigint NOT NULL,
+    reassignment_id text NOT NULL,
+    source_synchronizer_id text NOT NULL,
+    target_synchronizer_id text NOT NULL,
+    submitter text,
+    reassignment_counter bigint NOT NULL,
+    assignment_exclusivity timestamp with time zone
 );
 
 
@@ -1031,6 +1291,27 @@ CREATE TABLE pqs_relational.flyway_schema_history (
     execution_time integer NOT NULL,
     success boolean NOT NULL
 );
+
+
+--
+-- Name: reassignments; Type: VIEW; Schema: pqs_relational; Owner: -
+--
+
+CREATE VIEW pqs_relational.reassignments AS
+ SELECT e.ledger_offset,
+    e.node_id,
+    e.tx_ix,
+    e.contract_id,
+    e.event_kind,
+    r.reassignment_id,
+    r.source_synchronizer_id,
+    r.target_synchronizer_id,
+    r.submitter,
+    r.reassignment_counter,
+    r.assignment_exclusivity
+   FROM (pqs_relational.__query_events e
+     JOIN pqs_relational.__rel_reassignments r USING (event_pk))
+  WHERE ((e.ledger_offset >= pqs_relational.oldest_offset()) AND (e.ledger_offset <= pqs_relational.latest_offset()));
 
 
 --
@@ -1167,6 +1448,14 @@ ALTER TABLE ONLY pqs_relational.__rel_choice
 
 
 --
+-- Name: __rel_contract_tombstone __rel_contract_tombstone_pkey; Type: CONSTRAINT; Schema: pqs_relational; Owner: -
+--
+
+ALTER TABLE ONLY pqs_relational.__rel_contract_tombstone
+    ADD CONSTRAINT __rel_contract_tombstone_pkey PRIMARY KEY (contract_id);
+
+
+--
 -- Name: __rel_contract_visibility __rel_contract_visibility_pkey; Type: CONSTRAINT; Schema: pqs_relational; Owner: -
 --
 
@@ -1271,11 +1560,27 @@ ALTER TABLE ONLY pqs_relational.__rel_package
 
 
 --
+-- Name: __rel_pending_visibility __rel_pending_visibility_pkey; Type: CONSTRAINT; Schema: pqs_relational; Owner: -
+--
+
+ALTER TABLE ONLY pqs_relational.__rel_pending_visibility
+    ADD CONSTRAINT __rel_pending_visibility_pkey PRIMARY KEY (tx_ix, contract_id, party, role);
+
+
+--
 -- Name: __rel_pruning_metadata __rel_pruning_metadata_pkey; Type: CONSTRAINT; Schema: pqs_relational; Owner: -
 --
 
 ALTER TABLE ONLY pqs_relational.__rel_pruning_metadata
     ADD CONSTRAINT __rel_pruning_metadata_pkey PRIMARY KEY (singleton);
+
+
+--
+-- Name: __rel_reassignments __rel_reassignments_pkey; Type: CONSTRAINT; Schema: pqs_relational; Owner: -
+--
+
+ALTER TABLE ONLY pqs_relational.__rel_reassignments
+    ADD CONSTRAINT __rel_reassignments_pkey PRIMARY KEY (event_pk);
 
 
 --
@@ -1387,6 +1692,27 @@ CREATE INDEX __rel_contracts_life_idx ON pqs_relational.__rel_contracts USING gi
 --
 
 CREATE INDEX __rel_contracts_template_created_idx ON pqs_relational.__rel_contracts USING btree (template_entity_pk, created_tx_ix DESC, contract_pk DESC);
+
+
+--
+-- Name: __rel_redaction_contract_idx; Type: INDEX; Schema: pqs_relational; Owner: -
+--
+
+CREATE INDEX __rel_redaction_contract_idx ON pqs_relational.__rel_redaction USING btree (contract_id);
+
+
+--
+-- Name: __rel_redaction_event_idx; Type: INDEX; Schema: pqs_relational; Owner: -
+--
+
+CREATE INDEX __rel_redaction_event_idx ON pqs_relational.__rel_redaction USING btree (event_id_offset, event_id_node);
+
+
+--
+-- Name: __rel_tmp_lifecycle_contract_idx; Type: INDEX; Schema: pqs_relational; Owner: -
+--
+
+CREATE INDEX __rel_tmp_lifecycle_contract_idx ON pqs_relational.__rel_tmp_lifecycle USING btree (contract_id);
 
 
 --
